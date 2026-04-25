@@ -1,0 +1,57 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  RTL-SDR Scanner — Docker Compose Stack
+#
+#  Deploy this file as a Stack in Portainer.
+#  REQUIRED: Change SECRET_KEY before first run.
+#  REQUIRED: Your RTL-SDR dongle must be plugged in before the container starts.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  rtl-sdr-scanner:
+    image: rtl-sdr-scanner:latest        # built from local Dockerfile
+    # If pulling from a registry instead, replace the line above with:
+    # image: ghcr.io/youruser/rtl-sdr-scanner:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rtl-sdr-scanner
+
+    # ── Network ───────────────────────────────────────────────────────────────
+    ports:
+      - "${HOST_PORT:-8073}:8073"
+
+    # ── Environment ───────────────────────────────────────────────────────────
+    environment:
+      - PORT=8073
+      - CONFIG_FILE=/data/config.json
+      # CHANGE THIS — use `openssl rand -hex 32` to generate a secure value
+      - SECRET_KEY=${SECRET_KEY:-change_this_to_a_random_secret_key_before_running}
+
+    # ── Persistent Storage ────────────────────────────────────────────────────
+    volumes:
+      - rtl_sdr_data:/data               # stores config.json (frequencies, settings)
+
+    # ── USB / RTL-SDR Hardware Access ─────────────────────────────────────────
+    #
+    # Option A (recommended): pass through the entire USB bus.
+    # Works for most setups and is the simplest approach.
+    devices:
+      - /dev/bus/usb:/dev/bus/usb
+
+    # Option B: if Option A doesn't work, uncomment privileged mode instead.
+    # privileged: true
+
+    # ── Health + Restart ──────────────────────────────────────────────────────
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8073/api/status')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+# ── Named Volumes ─────────────────────────────────────────────────────────────
+volumes:
+  rtl_sdr_data:
+    driver: local
