@@ -1,6 +1,6 @@
 # RTL-SDR Scanner
 
-A self-hosted web application for scanning multiple radio frequencies with an RTL-SDR dongle. Configure a list of frequencies, set a squelch threshold, and the scanner will automatically cycle through them — dwelling on any channel where it detects a signal and advancing when silence is detected.
+A self-hosted web application for scanning multiple radio frequencies with an RTL-SDR dongle. Configure a list of frequencies, set a squelch threshold, and the scanner will automatically cycle through them - dwelling on any channel where it detects a signal and advancing when silence is detected.
 
 Any visitor can open the page and listen live. Only the admin account can add or remove frequencies, start or stop the scanner, or change settings.
 
@@ -8,20 +8,14 @@ Any visitor can open the page and listen live. Only the admin account can add or
 
 ## Features
 
-- **Multi-frequency auto-scan** — cycles through all configured frequencies, moves to the next after a configurable silence timeout (default 2 seconds)
-- **Software squelch** — tunable dBFS threshold; stays on a channel as long as signal is present
-- **Live audio streaming** — raw PCM decoded in the browser via Web Audio API, no plugins required
-- **Admin / visitor model** — visitors can listen; only the admin account manages frequencies and settings
-- **Real-time signal meter** — 20-segment LED-style bargraph updates at 10 Hz
-- **Persistent config** — frequencies and settings survive container restarts via a Docker volume
-- **Modes supported** — FM, AM, USB, LSB, RAW (anything `rtl_fm` accepts)
-- **PPM correction and gain control** — configurable from the web UI
-
----
-
-## Screenshots
-
-> Add screenshots here after first run.
+- **Multi-frequency auto-scan** - cycles through all configured frequencies, moves to the next after a configurable silence timeout (default 2 seconds)
+- **Software squelch** - tunable dBFS threshold; stays on a channel as long as signal is present
+- **Live audio streaming** - raw PCM decoded in the browser via Web Audio API, no plugins required
+- **Admin / visitor model** - visitors can listen; only the admin account manages frequencies and settings
+- **Real-time signal meter** - 20-segment LED-style bargraph updates at 10 Hz
+- **Persistent config** - frequencies and settings survive container restarts via a Docker volume
+- **Modes supported** - FM, AM, USB, LSB, RAW (anything `rtl_fm` accepts)
+- **PPM correction and gain control** - configurable from the web UI
 
 ---
 
@@ -40,53 +34,66 @@ The dongle must be plugged in **before** the container starts. If you plug it in
 
 ## Quick Start (Portainer)
 
-This is the recommended deployment method.
+This is the recommended deployment method. Portainer's Web Editor cannot access local host directories to build images, so you must build the image manually before deploying the stack.
 
 ### 1. Get the files
 
 Clone the repository on your Docker host:
 
 ```bash
-git clone https://github.com/NullAngst/rtl-sdr-scanner.git
+git clone [https://github.com/NullAngst/rtl-sdr-scanner.git](https://github.com/NullAngst/rtl-sdr-scanner.git)
 cd rtl-sdr-scanner
 ```
 
 Or download and extract the ZIP from the Releases page.
 
-### 2. Generate a secret key
+### 2. Build the Docker Image
+
+Build the image locally on your host machine:
+
+```bash
+docker build -t rtl-sdr-scanner:latest .
+```
+
+### 3. Generate a secret key
 
 ```bash
 openssl rand -hex 32
 ```
 
-Copy the output — you will paste it into the stack configuration in the next step.
+Copy the output - you will paste it into the stack configuration in the next step.
 
-### 3. Create the stack in Portainer
+### 4. Create the stack in Portainer
 
 1. Open Portainer and navigate to **Stacks > Add stack**
 2. Give the stack a name, e.g. `rtl-sdr-scanner`
-3. Choose **Upload** and select the `docker-compose.yml` file from the cloned repository
-
-   OR choose **Web editor** and paste the contents of `docker-compose.yml` directly
-
-4. Under **Environment variables**, add:
+3. Choose **Web editor** and paste the contents of `docker-compose.yml` directly.
+4. **Delete the `build` block** from the YAML configuration since you already built the image. Ensure your service definition uses the local image:
+   ```yaml
+   services:
+     rtl-sdr-scanner:
+       image: rtl-sdr-scanner:latest
+       container_name: rtl-sdr-scanner
+       # ... keep the rest of your configuration
+   ```
+5. Under **Environment variables**, add:
 
    | Variable | Value |
    |---|---|
    | `SECRET_KEY` | The hex string you generated above |
    | `HOST_PORT` | The port you want to access the UI on (default: `8073`) |
 
-5. Click **Deploy the stack**
+6. Click **Deploy the stack**
 
-Portainer will build the image from the Dockerfile and start the container.
+Portainer will pull the local image from your Docker cache and start the container.
 
-### 4. Access the UI
+### 5. Access the UI
 
 Open `http://your-host-ip:8073` in any browser.
 
 Default admin credentials:
 
-```
+```text
 Username: admin
 Password: changeme
 ```
@@ -121,12 +128,12 @@ If device passthrough does not work, add `--privileged` instead of the `--device
 
 ## First-Use Walkthrough
 
-1. **Log in** — click LOGIN in the top-right corner and enter the admin credentials
-2. **Change your password** — expand the Settings panel and set a new password
-3. **Add frequencies** — click `+ ADD` above the frequency list. Enter the frequency in Hz (e.g. `162400000` for 162.400 MHz NOAA Weather), a label, and a mode
-4. **Start the scanner** — click START SCAN. The display will show the current frequency and cycle automatically
-5. **Enable audio** — click ENABLE AUDIO. Audio starts immediately. Adjust volume with the slider
-6. **Share the URL** — any visitor who opens the page can enable audio and listen live without logging in
+1. **Log in** - click LOGIN in the top-right corner and enter the admin credentials
+2. **Change your password** - expand the Settings panel and set a new password
+3. **Add frequencies** - click `+ ADD` above the frequency list. Enter the frequency in Hz (e.g. `162400000` for 162.400 MHz NOAA Weather), a label, and a mode
+4. **Start the scanner** - click START SCAN. The display will show the current frequency and cycle automatically
+5. **Enable audio** - click ENABLE AUDIO. Audio starts immediately. Adjust volume with the slider
+6. **Share the URL** - any visitor who opens the page can enable audio and listen live without logging in
 
 ---
 
@@ -148,8 +155,8 @@ All settings are saved to `/data/config.json` inside the container (persisted vi
 |---|---|
 | `fm` | Broadcast FM, public safety, weather radio, MURS, FRS |
 | `am` | Aircraft (airband), AM broadcast |
-| `usb` | Upper sideband — ham radio, maritime, military |
-| `lsb` | Lower sideband — 40m/80m/160m ham bands |
+| `usb` | Upper sideband - ham radio, maritime, military |
+| `lsb` | Lower sideband - 40m/80m/160m ham bands |
 | `raw` | Raw I/Q output |
 
 ---
@@ -187,7 +194,7 @@ Enter frequencies in Hz (no decimals, no dots). For example, 162.400 MHz = `1624
 
 ### No audio in browser
 
-The Web Audio API requires user interaction before it can play sound — this is a browser security requirement. Click **ENABLE AUDIO** after the page loads. If you still get nothing, check that the scanner is running and a frequency is active.
+The Web Audio API requires user interaction before it can play sound - this is a browser security requirement. Click **ENABLE AUDIO** after the page loads. If you still get nothing, check that the scanner is running and a frequency is active.
 
 ### `rtl_fm: command not found`
 
@@ -237,13 +244,13 @@ Adjust **Squelch** and **Dwell Time** in the Settings panel:
 
 ### Sessions don't survive container restarts
 
-This is expected — the session table is in-memory. Log in again after a restart. If you need persistent sessions across restarts, switch the app to Flask's signed-cookie sessions (uses `SECRET_KEY`) or an external store like Redis.
+This is expected - the session table is in-memory. Log in again after a restart. If you need persistent sessions across restarts, switch the app to Flask's signed-cookie sessions (uses `SECRET_KEY`) or an external store like Redis.
 
 ---
 
 ## Architecture
 
-```
+```text
 Browser (any)
     |
     |  HTTP + WebSocket (Socket.IO)
@@ -266,7 +273,7 @@ The scanner runs in a background thread. It spawns `rtl_fm` as a subprocess and 
 ## Security Notes
 
 - This application has no HTTPS out of the box. Put it behind a reverse proxy (nginx, Caddy, Traefik) with TLS if you expose it to the internet
-- The default password is `changeme` — you are forced to change it on first login (8-character minimum)
+- The default password is `changeme` - you are forced to change it on first login (8-character minimum)
 - Passwords are stored as salted hashes via Werkzeug's `generate_password_hash`
 - Login attempts are rate-limited to 8 per IP per 5 minutes
 - Changing the password invalidates all other active sessions
