@@ -234,7 +234,7 @@ main {
   text-transform: uppercase;
 }
 #status-progress { font-size: 11px; color: var(--gd); letter-spacing: 2px; }
-#scanner-ctrls   { margin-left: auto; display: none; }
+#scanner-ctrls   { margin-left: auto; }
 
 /* ── Frequency Display ───────────────────────────────────────────────────── */
 #freq-panel { text-align: center; }
@@ -593,7 +593,7 @@ input[type=range]::-moz-range-thumb {
         <span id="status-label">IDLE</span>
       </div>
       <span id="status-progress"></span>
-      <div id="scanner-ctrls">
+      <div id="scanner-ctrls" class="hidden">
         <button class="btn btn-primary" id="btn-scan" onclick="toggleScanner()">START SCAN</button>
       </div>
     </div>
@@ -981,10 +981,27 @@ function updateScannerUI(data) {
 }
 
 async function toggleScanner() {
-  const endpoint = scanning ? '/api/scanner/stop' : '/api/scanner/start';
+  const btn = el('btn-scan');
+  const wasScanning = scanning;
+  const endpoint = wasScanning ? '/api/scanner/stop' : '/api/scanner/start';
+
+  // Disable the button briefly so a double-click doesn't double-fire.
+  btn.disabled = true;
+  const originalText = btn.textContent;
+  btn.textContent = wasScanning ? 'STOPPING…' : 'STARTING…';
+
   try {
     await api('POST', endpoint);
-  } catch(e) { toast(e.message || 'ERROR'); }
+    // The server emits scanner_update via Socket.IO, but if the socket is
+    // flaky we still want the UI to reflect reality. Force a status refresh.
+    await fetchStatus();
+    toast(wasScanning ? 'SCANNER STOPPED' : 'SCANNER STARTED');
+  } catch (e) {
+    btn.textContent = originalText;
+    toast(e.message || 'ERROR');
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 function setDot(state, label) {
