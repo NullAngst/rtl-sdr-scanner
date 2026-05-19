@@ -4,8 +4,6 @@ RTL-SDR Scanner Server
 Streams live audio from an RTL-SDR dongle to web browsers,
 with multi-frequency auto-scanning and squelch detection.
 """
-import eventlet
-eventlet.monkey_patch()
 import os
 import json
 import time
@@ -50,7 +48,7 @@ else:
 socketio = SocketIO(
     app,
     cors_allowed_origins=_cors_origins,
-    async_mode='eventlet',
+    async_mode='threading',
     max_http_buffer_size=2 * 1024 * 1024,
     logger=False,
     engineio_logger=False
