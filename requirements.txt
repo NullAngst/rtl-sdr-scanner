@@ -1,4 +1,5 @@
-flask~=3.0
-flask-socketio~=5.3
-numpy~=1.26
-Werkzeug~=3.0
+flask
+flask-socketio
+werkzeug
+numpy
+eventlet
