@@ -47,16 +47,14 @@ elif _origins_env:
     _cors_origins = [o.strip() for o in _origins_env.split(',') if o.strip()]
 else:
     _cors_origins = []  # same-origin only
-
+    
 socketio = SocketIO(
     app,
     cors_allowed_origins=_cors_origins,
-    async_mode='threading',
+    async_mode='eventlet',
     max_http_buffer_size=2 * 1024 * 1024,
     logger=False,
-    engineio_logger=False,
-    cors_allowed_origins="*",
-    async_mode='eventlet'
+    engineio_logger=False
 )
 
 # ── Config ────────────────────────────────────────────────────────────────────
