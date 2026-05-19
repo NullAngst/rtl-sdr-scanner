@@ -54,7 +54,9 @@ socketio = SocketIO(
     async_mode='threading',
     max_http_buffer_size=2 * 1024 * 1024,
     logger=False,
-    engineio_logger=False
+    engineio_logger=False,
+    cors_allowed_origins="*",
+    async_mode='eventlet'
 )
 
 # ── Config ────────────────────────────────────────────────────────────────────
