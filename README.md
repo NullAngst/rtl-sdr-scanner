@@ -91,7 +91,7 @@ Username: admin
 Password: changeme
 ```
 
-**Change the password immediately** via the Settings panel after logging in.
+On first login the UI will require you to set a new password (minimum 8 characters) before continuing. Existing installs with the legacy unsalted SHA-256 hash are automatically forced into the same flow on next startup.
 
 ---
 
@@ -160,9 +160,10 @@ These are set in `docker-compose.yml` or passed with `-e` on `docker run`:
 
 | Variable | Default | Description |
 |---|---|---|
-| `SECRET_KEY` | random | Signs session tokens. Set a fixed value so sessions survive container restarts |
+| `SECRET_KEY` | random | Signs Flask session tokens. Set a fixed value if you start using Flask sessions; currently the app uses an in-memory session table that does not survive restarts |
 | `CONFIG_FILE` | `/data/config.json` | Path to the config file inside the container |
 | `PORT` | `8073` | Port the server listens on inside the container |
+| `ALLOWED_ORIGINS` | *(unset)* | Socket.IO CORS allowlist. Unset = same-origin only. Set to `*` for unrestricted (not recommended) or a comma-separated origin list, e.g. `https://radio.example.com,https://intra.lan` |
 
 ---
 
@@ -236,7 +237,7 @@ Adjust **Squelch** and **Dwell Time** in the Settings panel:
 
 ### Sessions don't survive container restarts
 
-Set a fixed `SECRET_KEY` environment variable in `docker-compose.yml`. Without it, a new random key is generated each restart, which invalidates all existing session tokens.
+This is expected — the session table is in-memory. Log in again after a restart. If you need persistent sessions across restarts, switch the app to Flask's signed-cookie sessions (uses `SECRET_KEY`) or an external store like Redis.
 
 ---
 
@@ -265,8 +266,12 @@ The scanner runs in a background thread. It spawns `rtl_fm` as a subprocess and 
 ## Security Notes
 
 - This application has no HTTPS out of the box. Put it behind a reverse proxy (nginx, Caddy, Traefik) with TLS if you expose it to the internet
-- The default password is `changeme` — change it on first login
-- Session tokens are stored in `localStorage` on the client and expire after 24 hours
+- The default password is `changeme` — you are forced to change it on first login (8-character minimum)
+- Passwords are stored as salted hashes via Werkzeug's `generate_password_hash`
+- Login attempts are rate-limited to 8 per IP per 5 minutes
+- Changing the password invalidates all other active sessions
+- Session tokens are stored in `localStorage` on the client and expire after 24 hours. Tokens do not survive a container restart
+- Socket.IO CORS is locked to same-origin by default; widen it via `ALLOWED_ORIGINS` if you need to embed the UI cross-origin
 - There is one admin account. Multiple admin accounts are not supported
 
 ---
