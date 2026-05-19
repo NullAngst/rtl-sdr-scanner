@@ -4,7 +4,8 @@ RTL-SDR Scanner Server
 Streams live audio from an RTL-SDR dongle to web browsers,
 with multi-frequency auto-scanning and squelch detection.
 """
-
+import eventlet
+eventlet.monkey_patch()
 import os
 import json
 import time
@@ -22,8 +23,6 @@ import numpy as np
 from flask import Flask, request, jsonify, render_template
 from flask_socketio import SocketIO, join_room, leave_room
 from werkzeug.security import generate_password_hash, check_password_hash
-import eventlet
-eventlet.monkey_patch()
 
 logging.basicConfig(
     level=logging.INFO,
