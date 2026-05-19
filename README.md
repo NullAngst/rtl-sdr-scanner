@@ -47,7 +47,7 @@ This is the recommended deployment method.
 Clone the repository on your Docker host:
 
 ```bash
-git clone https://github.com/youruser/rtl-sdr-scanner.git
+git clone https://github.com/NullAngst/rtl-sdr-scanner.git
 cd rtl-sdr-scanner
 ```
 
