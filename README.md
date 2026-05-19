@@ -41,7 +41,7 @@ This is the recommended deployment method. Portainer's Web Editor cannot access 
 Clone the repository on your Docker host:
 
 ```bash
-git clone [https://github.com/NullAngst/rtl-sdr-scanner.git](https://github.com/NullAngst/rtl-sdr-scanner.git)
+git clone https://github.com/NullAngst/rtl-sdr-scanner.git
 cd rtl-sdr-scanner
 ```
 
