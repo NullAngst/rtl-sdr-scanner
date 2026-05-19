@@ -673,7 +673,7 @@ input[type=range]::-moz-range-thumb {
     <div class="panel">
       <div class="panel-hdr">AUDIO OUTPUT</div>
       <div id="audio-panel">
-        <button class="btn btn-amber" id="btn-audio" id="audio-toggle" onclick="toggleAudio()">
+        <button class="btn btn-amber" id="btn-audio" onclick="toggleAudio()">
           ENABLE AUDIO
         </button>
         <div class="vol-row">
@@ -723,9 +723,12 @@ input[type=range]::-moz-range-thumb {
         </div>
         <button class="btn btn-primary" onclick="saveSettings()" style="width:100%">APPLY SETTINGS</button>
         <hr class="sep-line">
+        <div id="pw-warn" class="hidden" style="padding:8px;margin-bottom:10px;border:1px solid #c33;background:#3a0e0e;color:#f88;font-size:12px">
+          ⚠ DEFAULT PASSWORD STILL IN USE — set a new one below.
+        </div>
         <div class="fg">
           <label>New Admin Password</label>
-          <input class="finput" id="s-pw" type="password" placeholder="min 6 characters">
+          <input class="finput" id="s-pw" type="password" placeholder="min 8 characters">
         </div>
         <button class="btn btn-danger" onclick="changePassword()" style="width:100%">CHANGE PASSWORD</button>
       </div>
@@ -844,7 +847,10 @@ const player = (() => {
 // ── Socket.IO ─────────────────────────────────────────────────────────────────
 const socket = io({ transports: ['websocket', 'polling'] });
 
-socket.on('connect',    () => fetchStatus());
+socket.on('connect',    () => {
+  fetchStatus();
+  if (audioOn) socket.emit('audio_subscribe');
+});
 socket.on('disconnect', () => setDot('idle', 'DISCONNECTED'));
 
 socket.on('scanner_update', data => updateScannerUI(data));
@@ -877,10 +883,28 @@ async function doLogin() {
     closeModal();
     setAdminUI(true);
     await loadSettings();
-    toast('AUTHENTICATED');
+    if (r.must_change_password) {
+      forcePasswordChange();
+    } else {
+      toast('AUTHENTICATED');
+    }
   } catch(e) {
     el('modal-err').textContent = e.message || 'LOGIN FAILED';
   }
+}
+
+function forcePasswordChange() {
+  toast('SET A NEW PASSWORD');
+  // Expand settings panel and focus the password field.
+  const body = el('settings-body');
+  if (body && !body.classList.contains('open')) {
+    body.classList.add('open');
+    const btn = body.previousElementSibling?.querySelector('.btn');
+    if (btn) btn.textContent = 'COLLAPSE';
+  }
+  const pw = el('s-pw');
+  if (pw) { pw.focus(); pw.placeholder = 'REQUIRED — min 8 characters'; }
+  el('pw-warn')?.classList.remove('hidden');
 }
 
 async function doLogout() {
@@ -895,10 +919,13 @@ async function doLogout() {
 async function checkToken() {
   if (!token) return;
   try {
-    await api('GET', '/api/verify');
+    const r = await api('GET', '/api/verify');
     isAdmin = true;
     setAdminUI(true);
     await loadSettings();
+    if (r && r.must_change_password) {
+      forcePasswordChange();
+    }
   } catch {
     token = '';
     localStorage.removeItem('sdr_token');
@@ -1067,10 +1094,13 @@ async function saveSettings() {
 
 async function changePassword() {
   const pw = el('s-pw').value;
-  if (pw.length < 6) { toast('MIN 6 CHARACTERS'); return; }
+  if (pw.length < 8) { toast('MIN 8 CHARACTERS'); return; }
   try {
     await api('POST', '/api/change_password', { password: pw });
     el('s-pw').value = '';
+    const pwInput = el('s-pw');
+    if (pwInput) pwInput.placeholder = 'min 8 characters';
+    el('pw-warn')?.classList.add('hidden');
     toast('PASSWORD CHANGED');
   } catch(e) { toast(e.message || 'ERROR'); }
 }
@@ -1081,10 +1111,12 @@ function toggleAudio() {
   const btn = el('btn-audio');
   if (audioOn) {
     player.init();
+    socket.emit('audio_subscribe');
     btn.textContent = 'DISABLE AUDIO';
     btn.className   = 'btn btn-danger';
     toast('AUDIO ENABLED');
   } else {
+    socket.emit('audio_unsubscribe');
     player.stop();
     btn.textContent = 'ENABLE AUDIO';
     btn.className   = 'btn btn-amber';
