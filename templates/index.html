@@ -569,7 +569,6 @@ input[type=range]::-moz-range-thumb {
 </head>
 <body>
 
-<!-- ── Header ────────────────────────────────────────────────────────────── -->
 <header>
   <div class="logo">RTL<span class="sep">-</span>SDR <span class="hi">SCANNER</span></div>
   <div class="header-right">
@@ -580,25 +579,23 @@ input[type=range]::-moz-range-thumb {
   </div>
 </header>
 
-<!-- ── Main ──────────────────────────────────────────────────────────────── -->
 <main>
 
-  <!-- ── Left Column ─────────────────────────────────────────────────────── -->
   <div style="display:flex;flex-direction:column;gap:18px">
 
-    <!-- Status Bar -->
     <div id="status-bar">
       <div class="dot-wrap">
         <div class="dot idle" id="dot"></div>
         <span id="status-label">IDLE</span>
       </div>
       <span id="status-progress"></span>
-      <div id="scanner-ctrls" class="hidden">
+      <div id="scanner-ctrls" class="hidden" style="display:flex;gap:8px;">
         <button class="btn btn-primary" id="btn-scan" onclick="toggleScanner()">START SCAN</button>
+        <button class="btn btn-amber hidden" id="btn-pause" onclick="togglePause()">PAUSE</button>
+        <button class="btn btn-primary hidden" id="btn-skip" onclick="skipScan()">SKIP</button>
       </div>
     </div>
 
-    <!-- Frequency Display -->
     <div class="panel" id="freq-panel">
       <div class="panel-hdr">CURRENT FREQUENCY</div>
 
@@ -606,7 +603,6 @@ input[type=range]::-moz-range-thumb {
       <div id="freq-name" class="glow-am">WAITING FOR SIGNAL</div>
       <div id="freq-mode-badge">MODE: --</div>
 
-      <!-- Signal Level -->
       <div id="sig-wrap">
         <div class="meter-lbl">SIGNAL LEVEL</div>
         <div class="meter-track">
@@ -616,20 +612,17 @@ input[type=range]::-moz-range-thumb {
           <span>-100</span><span>-80</span><span>-60</span>
           <span>-40</span><span>-20</span><span>0 dBFS</span>
         </div>
-        <!-- Segment display -->
         <div class="seg-row" id="segs"></div>
         <div id="meter-val">-- dBFS</div>
       </div>
     </div>
 
-    <!-- Frequency List -->
     <div class="panel">
       <div class="panel-hdr">
         FREQUENCIES
         <button class="btn btn-sm hidden" id="btn-add" onclick="toggleAddForm()">+ ADD</button>
       </div>
 
-      <!-- Add form -->
       <div id="add-form">
         <div class="fg">
           <label>Frequency (Hz)</label>
@@ -656,7 +649,6 @@ input[type=range]::-moz-range-thumb {
         </div>
       </div>
 
-      <!-- List -->
       <div id="freq-list-wrap">
         <ul class="freq-list" id="freq-list">
           <li class="empty-state">NO FREQUENCIES CONFIGURED</li>
@@ -666,15 +658,16 @@ input[type=range]::-moz-range-thumb {
 
   </div>
 
-  <!-- ── Right Column ─────────────────────────────────────────────────────── -->
   <div style="display:flex;flex-direction:column;gap:18px">
 
-    <!-- Audio -->
     <div class="panel">
       <div class="panel-hdr">AUDIO OUTPUT</div>
       <div id="audio-panel">
         <button class="btn btn-amber" id="btn-audio" onclick="toggleAudio()">
           ENABLE AUDIO
+        </button>
+        <button class="btn btn-primary" id="btn-mute-dead" onclick="toggleMuteDeadAir()">
+          MUTE DEAD AIR: ON
         </button>
         <div class="vol-row">
           <span class="vol-lbl">VOL</span>
@@ -685,7 +678,6 @@ input[type=range]::-moz-range-thumb {
       </div>
     </div>
 
-    <!-- Admin Settings -->
     <div class="panel hidden" id="settings-panel">
       <div class="panel-hdr">
         SETTINGS
@@ -724,7 +716,7 @@ input[type=range]::-moz-range-thumb {
         <button class="btn btn-primary" onclick="saveSettings()" style="width:100%">APPLY SETTINGS</button>
         <hr class="sep-line">
         <div id="pw-warn" class="hidden" style="padding:8px;margin-bottom:10px;border:1px solid #c33;background:#3a0e0e;color:#f88;font-size:12px">
-          ⚠ DEFAULT PASSWORD STILL IN USE — set a new one below.
+          ⚠ DEFAULT PASSWORD STILL IN USE - set a new one below.
         </div>
         <div class="fg">
           <label>New Admin Password</label>
@@ -734,7 +726,6 @@ input[type=range]::-moz-range-thumb {
       </div>
     </div>
 
-    <!-- System Info -->
     <div class="panel">
       <div class="panel-hdr">SYSTEM</div>
       <div id="sys-rows">
@@ -750,7 +741,6 @@ input[type=range]::-moz-range-thumb {
   </div>
 </main>
 
-<!-- ── Login Modal ────────────────────────────────────────────────────────── -->
 <div id="modal-overlay">
   <div class="modal">
     <div class="modal-title">// AUTHENTICATE</div>
@@ -771,22 +761,22 @@ input[type=range]::-moz-range-thumb {
   </div>
 </div>
 
-<!-- ── Toast ──────────────────────────────────────────────────────────────── -->
 <div id="toast"></div>
 
-<!-- ── Script ────────────────────────────────────────────────────────────────
-     All logic in one block: auth, scanner UI, audio playback, SocketIO.
-─────────────────────────────────────────────────────────────────────────── -->
 <script>
 'use strict';
 
 // ── State ────────────────────────────────────────────────────────────────────
-let token      = localStorage.getItem('sdr_token') || '';
-let isAdmin    = false;
-let scanning   = false;
-let audioOn    = false;
-let curIdx     = -1;
-let freqCache  = [];   // last known freq list
+let token          = localStorage.getItem('sdr_token') || '';
+let isAdmin        = false;
+let scanning       = false;
+let audioOn        = false;
+let curIdx         = -1;
+let freqCache      = [];
+
+let isPaused       = false;
+let currentSquelch = -35;
+let muteDeadAir    = true;
 
 // ── PCM Audio Player ──────────────────────────────────────────────────────────
 const player = (() => {
@@ -808,7 +798,7 @@ const player = (() => {
     vol = v;
     if (gain) gain.gain.value = v;
   }
-  function feed(b64, sr) {
+  function feed(b64, sr, db) {
     if (!ctx) return;
     try {
       const bin = atob(b64);
@@ -818,7 +808,13 @@ const player = (() => {
       const f32 = new Float32Array(i16.length);
       for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 32768;
       const buf = ctx.createBuffer(1, f32.length, sr);
-      buf.getChannelData(0).set(f32);
+
+      if (muteDeadAir && typeof db !== 'undefined' && db < currentSquelch) {
+          // Do nothing. getChannelData initializes to an array of zeros.
+      } else {
+          buf.getChannelData(0).set(f32);
+      }
+
       const src = ctx.createBufferSource();
       src.buffer = buf;
       src.connect(gain);
@@ -857,8 +853,8 @@ socket.on('scanner_update', data => updateScannerUI(data));
 
 socket.on('signal', ({ db }) => drawMeter(db));
 
-socket.on('audio', ({ data, sr }) => {
-  if (audioOn) player.feed(data, sr);
+socket.on('audio', ({ data, sr, db }) => {
+  if (audioOn) player.feed(data, sr, db);
 });
 
 socket.on('frequencies_updated', freqs => {
@@ -903,7 +899,7 @@ function forcePasswordChange() {
     if (btn) btn.textContent = 'COLLAPSE';
   }
   const pw = el('s-pw');
-  if (pw) { pw.focus(); pw.placeholder = 'REQUIRED — min 8 characters'; }
+  if (pw) { pw.focus(); pw.placeholder = 'REQUIRED - min 8 characters'; }
   el('pw-warn')?.classList.remove('hidden');
 }
 
@@ -945,7 +941,9 @@ function setAdminUI(on) {
 // ── Scanner UI ────────────────────────────────────────────────────────────────
 function updateScannerUI(data) {
   scanning = data.running;
-  const btn = el('btn-scan');
+  const btnScan = el('btn-scan');
+  const btnPause = el('btn-pause');
+  const btnSkip = el('btn-skip');
 
   if (!data.running) {
     setDot('idle', 'IDLE');
@@ -953,16 +951,24 @@ function updateScannerUI(data) {
     el('freq-big').innerHTML   = '---.-&nbsp;---';
     el('freq-name').textContent = 'WAITING FOR SIGNAL';
     el('freq-mode-badge').textContent = 'MODE: --';
-    btn.textContent  = 'START SCAN';
-    btn.className    = 'btn btn-primary';
+    btnScan.textContent  = 'START SCAN';
+    btnScan.className    = 'btn btn-primary';
+    btnPause.classList.add('hidden');
+    btnSkip.classList.add('hidden');
+    isPaused = false;
     curIdx = -1;
     renderFreqs(freqCache);
     return;
   }
 
-  setDot('active', 'SCANNING');
-  btn.textContent = 'STOP SCAN';
-  btn.className   = 'btn btn-stop';
+  btnPause.classList.remove('hidden');
+  btnSkip.classList.remove('hidden');
+
+  isPaused = !!data.paused;
+  updatePauseBtn();
+
+  btnScan.textContent = 'STOP SCAN';
+  btnScan.className   = 'btn btn-stop';
 
   if (data.freq) {
     const mhz = (data.freq.freq / 1e6).toFixed(3);
@@ -1002,6 +1008,42 @@ async function toggleScanner() {
   } finally {
     btn.disabled = false;
   }
+}
+
+async function togglePause() {
+  try {
+    const r = await api('POST', '/api/scanner/pause');
+    isPaused = r.paused;
+    updatePauseBtn();
+    toast(isPaused ? 'SCANNER PAUSED' : 'SCANNER RESUMED');
+  } catch(e) { toast(e.message || 'ERROR'); }
+}
+
+async function skipScan() {
+  try {
+    await api('POST', '/api/scanner/skip');
+    toast('SKIPPED');
+  } catch(e) { toast(e.message || 'ERROR'); }
+}
+
+function updatePauseBtn() {
+  const btn = el('btn-pause');
+  if (isPaused) {
+    btn.textContent = 'RESUME';
+    btn.className = 'btn btn-primary';
+    setDot('active', 'PAUSED');
+  } else {
+    btn.textContent = 'PAUSE';
+    btn.className = 'btn btn-amber';
+    setDot('active', 'SCANNING');
+  }
+}
+
+function toggleMuteDeadAir() {
+  muteDeadAir = !muteDeadAir;
+  const btn = el('btn-mute-dead');
+  btn.textContent = 'MUTE DEAD AIR: ' + (muteDeadAir ? 'ON' : 'OFF');
+  btn.className = muteDeadAir ? 'btn btn-primary' : 'btn btn-amber';
 }
 
 function setDot(state, label) {
@@ -1086,6 +1128,9 @@ async function loadSettings() {
     el('s-ppm').value     = s.ppm         ?? 0;
     const sr = el('s-sr');
     if (sr) sr.value = String(s.sample_rate ?? 16000);
+    
+    if (typeof s.squelch_db !== 'undefined') currentSquelch = s.squelch_db;
+
     // Sysinfo
     el('sys-sql').textContent   = (s.squelch_db ?? '--') + ' dBFS';
     el('sys-dwell').textContent = (s.dwell_time  ?? '--') + ' s';
@@ -1202,11 +1247,13 @@ async function fetchStatus() {
   try {
     const d = await api('GET', '/api/status', null, false);
     freqCache = d.frequencies || [];
+    currentSquelch = d.squelch_db ?? -35;
     el('sys-conn').textContent = d.connected ?? '--';
     renderFreqs(freqCache);
     drawMeter(d.signal_db ?? -100);
     updateScannerUI({
       running: d.running,
+      paused: d.paused,
       freq:    d.current_freq,
       idx:     d.current_idx ?? 0,
       total:   freqCache.length,
