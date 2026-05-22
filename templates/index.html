@@ -324,7 +324,7 @@ input[type=range]::-moz-range-thumb { width: 13px; height: 13px; background: var
           <button class="btn btn-primary" id="btn-mute-dead" onclick="toggleMuteDeadAir()" style="width:100%">
             MUTE DEAD AIR: ON
           </button>
-          <div class="help-text">When ON, the browser will force total silence when the signal meter drops below your Audio Squelch threshold, preventing loud static bursts.</div>
+          <div class="help-text">When ON, the browser will force absolute silence whenever your selected Squelch Mode considers the channel inactive.</div>
         </div>
         <div class="vol-row">
           <span class="vol-lbl">VOL</span>
@@ -341,25 +341,60 @@ input[type=range]::-moz-range-thumb { width: 13px; height: 13px; background: var
       </div>
       <div id="settings-body">
         
-        <div class="tuning-guide">
-          <div style="color:var(--am); margin-bottom:4px;">► SQUELCH TUNING GUIDE</div>
-          If you have stations that are "dead air" but still break the scanner squelch because the static is loud (e.g. -21 dBFS):<br><br>
-          1. Set <b>Audio Squelch</b> to <b>-50</b> (ignores silence but catches quiet voices).<br>
-          2. Slowly raise <b>RF Squelch</b> from 0 until the loud static drops to -100 dBFS on the meter.<br>
-          3. The scanner will now skip the static but play quiet voices!
+        <div class="tuning-guide" id="guide-audio">
+          <div style="color:var(--am); margin-bottom:4px;">► AUDIO SQUELCH</div>
+          Triggers based on absolute volume. If the volume drops below the threshold, the scanner skips to the next channel. Simple, but easily confused by loud static.
+        </div>
+        <div class="tuning-guide hidden" id="guide-rf">
+          <div style="color:var(--am); margin-bottom:4px;">► RF SQUELCH</div>
+          Triggers based on the invisible hardware carrier wave. It kills all dead air dead in its tracks. Slowly raise the number from 0 until the loud static drops to -100 dBFS. Requires a restart.
+        </div>
+        <div class="tuning-guide hidden" id="guide-diff">
+          <div style="color:var(--am); margin-bottom:4px;">► DB DIFF SQUELCH</div>
+          The ultimate solution for "FM Quieting" (where voice is quieter than static). It watches for <b>fluctuations</b> in the audio. Set to 3.0 to skip flat static but pause on dynamic voice.
         </div>
 
         <div class="set-row">
           <div class="fg">
-            <label>Audio Squelch (dBFS)</label>
-            <input class="finput" id="s-squelch" type="number" step="1">
-            <div class="help-text">Volume threshold to pause scanning. 0 is max volume, -100 is silence. Usually <b>-35</b> or <b>-50</b>.</div>
+            <label>Active Squelch Mode</label>
+            <select class="fselect" id="s-sq-mode" onchange="updateSquelchVis()">
+              <option value="audio">Standard Audio (Absolute)</option>
+              <option value="diff">DB Diff (Delta Volume)</option>
+              <option value="rf">RF Carrier (Hardware)</option>
+            </select>
           </div>
           <div class="fg">
             <label>Dwell Time (s)</label>
             <input class="finput" id="s-dwell" type="number" step="0.5" min="0.5">
-            <div class="help-text">Seconds to wait in silence before moving to the next frequency. Usually <b>2.0</b>.</div>
+            <div class="help-text">Seconds to wait in silence before moving.</div>
           </div>
+        </div>
+
+        <div class="set-row" id="wrap-sq-audio">
+          <div class="fg">
+            <label>Audio Squelch (dBFS)</label>
+            <input class="finput" id="s-squelch" type="number" step="1">
+            <div class="help-text">Volume threshold (e.g. -35).</div>
+          </div>
+          <div class="fg"></div>
+        </div>
+        
+        <div class="set-row hidden" id="wrap-sq-rf">
+          <div class="fg">
+            <label>RF Squelch</label>
+            <input class="finput" id="s-rf-squelch" type="number" step="1">
+            <div class="help-text">Hardware threshold (e.g. 20).</div>
+          </div>
+          <div class="fg"></div>
+        </div>
+
+        <div class="set-row hidden" id="wrap-sq-diff">
+          <div class="fg">
+            <label>DB Diff Threshold</label>
+            <input class="finput" id="s-diff-squelch" type="number" step="0.5">
+            <div class="help-text">Required volume change (e.g. 3.0).</div>
+          </div>
+          <div class="fg"></div>
         </div>
         
         <div class="set-row">
@@ -371,26 +406,19 @@ input[type=range]::-moz-range-thumb { width: 13px; height: 13px; background: var
               <option value="24000">24000 Hz</option>
               <option value="48000">48000 Hz</option>
             </select>
-            <div class="help-text">Audio playback quality. Requires scanner restart. Usually <b>16000</b>.</div>
+            <div class="help-text">Requires scanner restart.</div>
           </div>
           <div class="fg">
             <label>PPM Correction</label>
             <input class="finput" id="s-ppm" type="number" step="1">
-            <div class="help-text">Hardware frequency oscillator correction. Usually <b>0</b>.</div>
+            <div class="help-text">Hardware freq correction.</div>
           </div>
         </div>
         
-        <div class="set-row">
-          <div class="fg">
-            <label>RF Squelch</label>
-            <input class="finput" id="s-rf-squelch" type="number" step="1">
-            <div class="help-text">Hardware carrier wave threshold. Use <b>0</b> to disable, or <b>10-150</b> to kill dead air static.</div>
-          </div>
-          <div class="fg">
-            <label>Gain (dB)</label>
-            <input class="finput" id="s-gain" type="text">
-            <div class="help-text">Hardware antenna gain. Type <b>auto</b> or a number like <b>40</b>.</div>
-          </div>
+        <div class="fg">
+          <label>Gain (dB)</label>
+          <input class="finput" id="s-gain" type="text">
+          <div class="help-text">Type <b>auto</b> or a number like <b>40</b>.</div>
         </div>
         
         <button class="btn btn-primary" onclick="saveSettings()" style="width:100%; margin-top:8px;">APPLY SETTINGS</button>
@@ -402,7 +430,6 @@ input[type=range]::-moz-range-thumb { width: 13px; height: 13px; background: var
         <div class="fg">
           <label>New Admin Password</label>
           <input class="finput" id="s-pw" type="password" placeholder="min 8 characters">
-          <div class="help-text">Changing this will log out all other devices.</div>
         </div>
         <button class="btn btn-danger" onclick="changePassword()" style="width:100%">CHANGE PASSWORD</button>
       </div>
@@ -413,11 +440,11 @@ input[type=range]::-moz-range-thumb { width: 13px; height: 13px; background: var
       <div id="sys-rows">
         <div class="sys-row">VERSION   <span class="sys-val">1.0.0</span></div>
         <div class="sys-row">LISTENERS <span class="sys-val" id="sys-conn">--</span></div>
-        <div class="sys-row">AUDIO SQL <span class="sys-val" id="sys-sql">--</span></div>
-        <div class="sys-row">DWELL     <span class="sys-val" id="sys-dwell">--</span></div>
+        <div class="sys-row" style="color:var(--am); margin-top:8px;">ACTIVE SQUELCH MODE</div>
+        <div class="sys-row">MODE      <span class="sys-val" id="sys-sq-mode">--</span></div>
+        <div class="sys-row" style="color:var(--am); margin-top:8px;">RADIO SETTINGS</div>
         <div class="sys-row">GAIN      <span class="sys-val" id="sys-gain">--</span></div>
         <div class="sys-row">PPM       <span class="sys-val" id="sys-ppm">--</span></div>
-        <div class="sys-row">RF SQL    <span class="sys-val" id="sys-rf-sql">--</span></div>
       </div>
     </div>
 
@@ -457,7 +484,6 @@ let curIdx         = -1;
 let freqCache      = [];
 
 let isPaused       = false;
-let currentSquelch = -35;
 let muteDeadAir    = true;
 
 // PCM Audio Player
@@ -480,7 +506,7 @@ const player = (() => {
     vol = v;
     if (gain) gain.gain.value = v;
   }
-  function feed(b64, sr, db) {
+  function feed(b64, sr, db, sq) {
     if (!ctx) return;
     try {
       const bin = atob(b64);
@@ -491,7 +517,8 @@ const player = (() => {
       for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 32768;
       const buf = ctx.createBuffer(1, f32.length, sr);
 
-      if (muteDeadAir && typeof db !== 'undefined' && db < currentSquelch) {
+      // The server calculates silence logic based on your chosen Squelch mode and sends it as 'sq'.
+      if (muteDeadAir && sq === true) {
           // Do nothing. getChannelData initializes to an array of zeros.
       } else {
           buf.getChannelData(0).set(f32);
@@ -534,8 +561,8 @@ socket.on('scanner_update', data => updateScannerUI(data));
 
 socket.on('signal', ({ db }) => drawMeter(db));
 
-socket.on('audio', ({ data, sr, db }) => {
-  if (audioOn) player.feed(data, sr, db);
+socket.on('audio', ({ data, sr, db, sq }) => {
+  if (audioOn) player.feed(data, sr, db, sq);
 });
 
 socket.on('frequencies_updated', freqs => {
@@ -793,37 +820,51 @@ async function deleteFreq(idx) {
 }
 
 // Settings
+function updateSquelchVis() {
+  const mode = el('s-sq-mode').value;
+  tog('wrap-sq-audio', mode === 'audio');
+  tog('wrap-sq-rf', mode === 'rf');
+  tog('wrap-sq-diff', mode === 'diff');
+  
+  tog('guide-audio', mode === 'audio');
+  tog('guide-rf', mode === 'rf');
+  tog('guide-diff', mode === 'diff');
+}
+
 async function loadSettings() {
   try {
     const s = await api('GET', '/api/settings');
-    el('s-squelch').value = s.squelch_db ?? -35;
-    el('s-dwell').value   = s.dwell_time  ?? 2;
-    el('s-gain').value    = s.gain        ?? 'auto';
-    el('s-ppm').value     = s.ppm         ?? 0;
-    el('s-rf-squelch').value = s.rf_squelch ?? 0;
+    
+    el('s-sq-mode').value      = s.squelch_mode ?? 'audio';
+    el('s-squelch').value      = s.squelch_db ?? -35;
+    el('s-rf-squelch').value   = s.rf_squelch ?? 0;
+    el('s-diff-squelch').value = s.diff_squelch ?? 3.0;
+    
+    el('s-dwell').value        = s.dwell_time  ?? 2;
+    el('s-gain').value         = s.gain        ?? 'auto';
+    el('s-ppm').value          = s.ppm         ?? 0;
     
     const sr = el('s-sr');
     if (sr) sr.value = String(s.sample_rate ?? 16000);
     
-    if (typeof s.squelch_db !== 'undefined') currentSquelch = s.squelch_db;
+    updateSquelchVis();
 
-    el('sys-sql').textContent   = (s.squelch_db ?? '--') + ' dBFS';
-    el('sys-dwell').textContent = (s.dwell_time  ?? '--') + ' s';
+    el('sys-sq-mode').textContent = (s.squelch_mode ?? 'audio').toUpperCase();
     el('sys-gain').textContent  = s.gain  ?? '--';
     el('sys-ppm').textContent   = s.ppm   ?? '--';
-    const sysRf = el('sys-rf-sql');
-    if(sysRf) sysRf.textContent = s.rf_squelch ?? 0;
   } catch {}
 }
 
 async function saveSettings() {
   const body = {
-    squelch_db:  parseFloat(el('s-squelch').value),
-    dwell_time:  parseFloat(el('s-dwell').value),
-    sample_rate: parseInt(el('s-sr').value),
-    ppm:         parseInt(el('s-ppm').value),
-    gain:        el('s-gain').value.trim(),
-    rf_squelch:  parseInt(el('s-rf-squelch').value) || 0,
+    squelch_mode: el('s-sq-mode').value,
+    squelch_db:   parseFloat(el('s-squelch').value),
+    rf_squelch:   parseInt(el('s-rf-squelch').value) || 0,
+    diff_squelch: parseFloat(el('s-diff-squelch').value) || 3.0,
+    dwell_time:   parseFloat(el('s-dwell').value),
+    sample_rate:  parseInt(el('s-sr').value),
+    ppm:          parseInt(el('s-ppm').value),
+    gain:         el('s-gain').value.trim(),
   };
   try {
     await api('POST', '/api/settings', body);
@@ -925,8 +966,11 @@ async function fetchStatus() {
   try {
     const d = await api('GET', '/api/status', null, false);
     freqCache = d.frequencies || [];
-    currentSquelch = d.squelch_db ?? -35;
     el('sys-conn').textContent = d.connected ?? '--';
+    
+    // Set squelch mode in sys info early on load
+    if (d.squelch_mode) el('sys-sq-mode').textContent = d.squelch_mode.toUpperCase();
+    
     renderFreqs(freqCache);
     drawMeter(d.signal_db ?? -100);
     updateScannerUI({
