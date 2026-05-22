@@ -412,8 +412,12 @@ class Scanner:
 
                         # Determine if this chunk is considered "Silence"
                         is_silence = False
-                        if sq_mode == 'rf':
-                            # If we are getting audio data in RF mode, the hardware gate is open.
+                        
+                        # Apply absolute squelch floor for all modes
+                        if db < sq_db:
+                            is_silence = True
+                        elif sq_mode == 'rf':
+                            # If we are getting audio data in RF mode and passed db check, gate is open.
                             is_silence = False
                         elif sq_mode == 'diff':
                             # Need a few chunks to establish a baseline
@@ -426,8 +430,7 @@ class Scanner:
                                 else:
                                     is_silence = True
                         else:  # 'audio'
-                            if db < sq_db:
-                                is_silence = True
+                            is_silence = False
 
                         socketio.emit('signal', {'db': round(db, 1)})
                         socketio.emit('audio', {
