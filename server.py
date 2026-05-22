@@ -28,7 +28,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# Valid rtl_fm demodulation modes — passed straight to `rtl_fm -M`.
+# Valid rtl_fm demodulation modes - passed straight to `rtl_fm -M`.
 VALID_MODES = {'fm', 'am', 'usb', 'lsb', 'raw', 'wbfm'}
 
 # ── App Setup ─────────────────────────────────────────────────────────────────
@@ -81,12 +81,12 @@ def load_config() -> dict:
                 data = json.load(f)
             for k, v in DEFAULTS.items():
                 data.setdefault(k, v)
-            # Migrate legacy unsalted SHA-256 hashes (64 hex chars) — replace
+            # Migrate legacy unsalted SHA-256 hashes (64 hex chars) - replace
             # with an unknowable password and force a reset on next login.
             ph = data.get('admin_password_hash', '')
             if (isinstance(ph, str) and len(ph) == 64 and
                     all(c in '0123456789abcdef' for c in ph.lower())):
-                log.warning('Legacy SHA-256 password hash detected — '
+                log.warning('Legacy SHA-256 password hash detected - '
                             'forcing password reset')
                 data['admin_password_hash'] = generate_password_hash(
                     secrets.token_hex(32))
@@ -98,7 +98,7 @@ def load_config() -> dict:
 
 
 def save_config():
-    """Atomic write — tmp file in same directory, fsync, then os.replace."""
+    """Atomic write - tmp file in same directory, fsync, then os.replace."""
     with _cfg_lock:
         try:
             directory = os.path.dirname(CONFIG_FILE) or '.'
@@ -248,6 +248,8 @@ class Scanner:
 
     def __init__(self):
         self.running = False
+        self.paused = False
+        self.force_skip = False
         self.current_idx = 0
         self.current_freq: dict | None = None
         self.signal_db = -100.0
@@ -274,7 +276,7 @@ class Scanner:
                     pass
 
     def _drain_stderr(self, proc: subprocess.Popen):
-        """Log rtl_fm stderr instead of discarding it — surfaces gain errors,
+        """Log rtl_fm stderr instead of discarding it - surfaces gain errors,
         device-busy issues, etc."""
         try:
             for raw in iter(proc.stderr.readline, b''):
@@ -297,7 +299,7 @@ class Scanner:
             '-s', '200000',   # capture sample rate (200 kHz)
             '-r', sr,         # output resample rate
             '-p', ppm,        # PPM frequency correction
-            '-l', '0',        # hardware squelch off — we handle in software
+            '-l', '0',        # hardware squelch off - we handle in software
             '-'               # output to stdout
         ]
         if gain != 'auto':
@@ -357,6 +359,7 @@ class Scanner:
 
             socketio.emit('scanner_update', {
                 'running': True,
+                'paused': self.paused,
                 'idx': idx,
                 'total': len(freqs),
                 'freq': fi,
@@ -377,7 +380,7 @@ class Scanner:
             try:
                 proc = self._start_rtl(fi['freq'], mode)
             except FileNotFoundError:
-                log.error('rtl_fm not found — install the rtl-sdr package')
+                log.error('rtl_fm not found - install the rtl-sdr package')
                 self.running = False
                 break
             except Exception as e:
@@ -394,6 +397,11 @@ class Scanner:
             chunks_read = 0
 
             while self.running:
+                if self.force_skip:
+                    self.force_skip = False
+                    self.current_idx = (idx + 1) % len(freqs)
+                    break
+
                 try:
                     chunk = proc.stdout.read(chunk_bytes)
                 except Exception as e:
@@ -415,6 +423,7 @@ class Scanner:
                 socketio.emit('audio', {
                     'data': base64.b64encode(chunk).decode('ascii'),
                     'sr': sr,
+                    'db': round(db, 1)
                 }, room='audio')
 
                 # Re-read squelch/dwell every chunk so live setting changes
@@ -426,13 +435,13 @@ class Scanner:
                 if db < squelch:
                     if silence_start is None:
                         silence_start = time.time()
-                    elif (time.time() - silence_start) >= dwell:
+                    elif not self.paused and (time.time() - silence_start) >= dwell:
                         log.info(f'Silence for {dwell}s on '
                                  f'{fi["freq"]/1e6:.3f} MHz, advancing')
                         self.current_idx = (idx + 1) % len(freqs)
                         break
                 else:
-                    silence_start = None   # Active signal — reset
+                    silence_start = None   # Active signal - reset
 
             self._kill_proc()
             if chunks_read > 0:
@@ -548,7 +557,7 @@ def logout():
 
 @app.route('/api/verify', methods=['GET'])
 def verify():
-    """Check if a token is still valid — used on page load."""
+    """Check if a token is still valid - used on page load."""
     token = request.headers.get('X-Token', '')
     if is_valid_token(token):
         with _cfg_lock:
@@ -561,13 +570,16 @@ def verify():
 def status():
     with _cfg_lock:
         freqs = list(cfg.get('frequencies', []))
+        squelch = cfg.get('squelch_db', -35.0)
     with _connected_lock:
         conn = _connected
     return jsonify(
         running=scanner.running,
+        paused=scanner.paused,
         current_freq=scanner.current_freq,
         current_idx=scanner.current_idx,
         signal_db=round(scanner.signal_db, 1),
+        squelch_db=squelch,
         frequencies=freqs,
         connected=conn,
     )
@@ -681,6 +693,27 @@ def stop_scanner():
     # Don't block the HTTP worker on thread join.
     scanner.stop(join_timeout=0.5)
     return jsonify(running=False)
+
+
+@app.route('/api/scanner/pause', methods=['POST'])
+@admin_required
+def pause_scanner():
+    scanner.paused = not scanner.paused
+    socketio.emit('scanner_update', {
+        'running': scanner.running,
+        'paused': scanner.paused,
+        'idx': scanner.current_idx,
+        'total': len(cfg.get('frequencies', [])),
+        'freq': scanner.current_freq,
+    })
+    return jsonify(paused=scanner.paused)
+
+
+@app.route('/api/scanner/skip', methods=['POST'])
+@admin_required
+def skip_scanner():
+    scanner.force_skip = True
+    return jsonify(ok=True)
 
 
 # ── Settings ──────────────────────────────────────────────────────────────────
@@ -807,7 +840,7 @@ if __name__ == '__main__':
     log.info(f'RTL-SDR Scanner starting on 0.0.0.0:{port}')
     log.info(f'Config file: {CONFIG_FILE}')
     if cfg.get('must_change_password'):
-        log.warning('Default credentials in use: admin / changeme — '
+        log.warning('Default credentials in use: admin / changeme - '
                     'CHANGE THE PASSWORD on first login')
     socketio.run(
         app,
