@@ -28,10 +28,10 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# Valid rtl_fm demodulation modes - passed straight to `rtl_fm -M`.
+# Valid rtl_fm demodulation modes passed straight to `rtl_fm -M`.
 VALID_MODES = {'fm', 'am', 'usb', 'lsb', 'raw', 'wbfm'}
 
-# ── App Setup ─────────────────────────────────────────────────────────────────
+# App Setup
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', secrets.token_hex(32))
 
@@ -54,7 +54,7 @@ socketio = SocketIO(
     engineio_logger=False
 )
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# Config
 CONFIG_FILE = os.environ.get('CONFIG_FILE', '/data/config.json')
 
 DEFAULTS = {
@@ -68,6 +68,7 @@ DEFAULTS = {
     'sample_rate': 16000,
     'ppm': 0,
     'gain': 'auto',
+    'rf_squelch': 0,
 }
 
 # Lock protects all reads/writes of cfg and the config file on disk.
@@ -81,12 +82,12 @@ def load_config() -> dict:
                 data = json.load(f)
             for k, v in DEFAULTS.items():
                 data.setdefault(k, v)
-            # Migrate legacy unsalted SHA-256 hashes (64 hex chars) - replace
+            # Migrate legacy unsalted SHA-256 hashes (64 hex chars) replace
             # with an unknowable password and force a reset on next login.
             ph = data.get('admin_password_hash', '')
             if (isinstance(ph, str) and len(ph) == 64 and
                     all(c in '0123456789abcdef' for c in ph.lower())):
-                log.warning('Legacy SHA-256 password hash detected - '
+                log.warning('Legacy SHA-256 password hash detected, '
                             'forcing password reset')
                 data['admin_password_hash'] = generate_password_hash(
                     secrets.token_hex(32))
@@ -98,7 +99,7 @@ def load_config() -> dict:
 
 
 def save_config():
-    """Atomic write - tmp file in same directory, fsync, then os.replace."""
+    """Atomic write tmp file in same directory, fsync, then os.replace."""
     with _cfg_lock:
         try:
             directory = os.path.dirname(CONFIG_FILE) or '.'
@@ -123,7 +124,7 @@ def save_config():
 
 cfg = load_config()
 
-# ── Session Auth ──────────────────────────────────────────────────────────────
+# Session Auth
 # In-memory sessions; cleared on container restart. For multi-worker or
 # persistent sessions, swap for Flask signed-cookie sessions or external store.
 _sessions: dict[str, float] = {}   # token -> expiry timestamp
@@ -164,7 +165,7 @@ def admin_required(f):
     return wrapper
 
 
-# ── Login Rate Limiting ───────────────────────────────────────────────────────
+# Login Rate Limiting
 # Simple in-memory sliding window per client IP. Caps brute-force throughput
 # without pulling in a full rate-limit library.
 _login_attempts: dict[str, deque] = defaultdict(deque)
@@ -199,7 +200,7 @@ def client_ip() -> str:
     return request.remote_addr or '0.0.0.0'
 
 
-# ── Connected Client Tracking ─────────────────────────────────────────────────
+# Connected Client Tracking
 _connected = 0
 _connected_lock = threading.Lock()
 
@@ -235,7 +236,7 @@ def on_audio_unsubscribe():
     leave_room('audio')
 
 
-# ── Scanner ───────────────────────────────────────────────────────────────────
+# Scanner
 class Scanner:
     """
     Manages the rtl_fm subprocess and frequency-scanning loop.
@@ -258,7 +259,7 @@ class Scanner:
         self._thread: threading.Thread | None = None
         self._stderr_thread: threading.Thread | None = None
 
-    # ── Process control ───────────────────────────────────────────────────────
+    # Process control
 
     def _kill_proc(self):
         with self._proc_lock:
@@ -276,7 +277,7 @@ class Scanner:
                     pass
 
     def _drain_stderr(self, proc: subprocess.Popen):
-        """Log rtl_fm stderr instead of discarding it - surfaces gain errors,
+        """Log rtl_fm stderr instead of discarding it surfaces gain errors,
         device-busy issues, etc."""
         try:
             for raw in iter(proc.stderr.readline, b''):
@@ -291,6 +292,7 @@ class Scanner:
             gain = cfg.get('gain', 'auto')
             sr = str(cfg.get('sample_rate', 16000))
             ppm = str(cfg.get('ppm', 0))
+            rf_sql = str(cfg.get('rf_squelch', 0))
 
         cmd = [
             'rtl_fm',
@@ -299,7 +301,7 @@ class Scanner:
             '-s', '200000',   # capture sample rate (200 kHz)
             '-r', sr,         # output resample rate
             '-p', ppm,        # PPM frequency correction
-            '-l', '0',        # hardware squelch off - we handle in software
+            '-l', rf_sql,     # hardware RF squelch
             '-'               # output to stdout
         ]
         if gain != 'auto':
@@ -320,7 +322,7 @@ class Scanner:
         self._stderr_thread.start()
         return proc
 
-    # ── Signal analysis ───────────────────────────────────────────────────────
+    # Signal analysis
 
     @staticmethod
     def rms_db(raw: bytes) -> float:
@@ -333,7 +335,7 @@ class Scanner:
             return -100.0
         return float(20.0 * np.log10(rms / 32768.0))
 
-    # ── Main scan loop ────────────────────────────────────────────────────────
+    # Main scan loop
 
     def _loop(self):
         consecutive_failures = 0
@@ -380,7 +382,7 @@ class Scanner:
             try:
                 proc = self._start_rtl(fi['freq'], mode)
             except FileNotFoundError:
-                log.error('rtl_fm not found - install the rtl-sdr package')
+                log.error('rtl_fm not found, install the rtl-sdr package')
                 self.running = False
                 break
             except Exception as e:
@@ -441,7 +443,7 @@ class Scanner:
                         self.current_idx = (idx + 1) % len(freqs)
                         break
                 else:
-                    silence_start = None   # Active signal - reset
+                    silence_start = None   # Active signal reset
 
             self._kill_proc()
             if chunks_read > 0:
@@ -502,7 +504,7 @@ class Scanner:
 scanner = Scanner()
 
 
-# ── API Routes ────────────────────────────────────────────────────────────────
+# API Routes
 
 @app.route('/')
 def index():
@@ -557,7 +559,7 @@ def logout():
 
 @app.route('/api/verify', methods=['GET'])
 def verify():
-    """Check if a token is still valid - used on page load."""
+    """Check if a token is still valid used on page load."""
     token = request.headers.get('X-Token', '')
     if is_valid_token(token):
         with _cfg_lock:
@@ -585,7 +587,7 @@ def status():
     )
 
 
-# ── Frequency Management ──────────────────────────────────────────────────────
+# Frequency Management
 
 @app.route('/api/frequencies', methods=['GET'])
 def get_freqs():
@@ -606,7 +608,7 @@ def add_freq():
         return jsonify(error='freq must be an integer (Hz)'), 400
     if freq < 500_000 or freq > 1_750_000_000:
         return jsonify(
-            error='freq out of RTL-SDR range (0.5 MHz - 1750 MHz)'), 400
+            error='freq out of RTL-SDR range (0.5 MHz to 1750 MHz)'), 400
 
     mode = str(d.get('mode', 'fm')).lower().strip()
     if mode not in VALID_MODES:
@@ -674,7 +676,7 @@ def del_freq(idx):
     return jsonify(removed)
 
 
-# ── Scanner Control ───────────────────────────────────────────────────────────
+# Scanner Control
 
 @app.route('/api/scanner/start', methods=['POST'])
 @admin_required
@@ -716,9 +718,9 @@ def skip_scanner():
     return jsonify(ok=True)
 
 
-# ── Settings ──────────────────────────────────────────────────────────────────
+# Settings
 
-SETTINGS_KEYS = ('squelch_db', 'dwell_time', 'sample_rate', 'ppm', 'gain')
+SETTINGS_KEYS = ('squelch_db', 'dwell_time', 'sample_rate', 'ppm', 'gain', 'rf_squelch')
 
 
 def _coerce_settings(d: dict) -> tuple[dict, str | None]:
@@ -768,6 +770,14 @@ def _coerce_settings(d: dict) -> tuple[dict, str | None]:
             if not 0 <= gv <= 100:
                 return {}, 'gain must be between 0 and 100 dB'
             out['gain'] = g  # keep original string form for rtl_fm
+    if 'rf_squelch' in d:
+        try:
+            v = int(d['rf_squelch'])
+        except (ValueError, TypeError):
+            return {}, 'rf_squelch must be an integer'
+        if not 0 <= v <= 1000:
+            return {}, 'rf_squelch must be between 0 and 1000'
+        out['rf_squelch'] = v
     return out, None
 
 
@@ -796,8 +806,8 @@ def update_settings():
         if clean:
             save_config()
 
-    # squelch/dwell take effect live. gain/ppm/sample_rate require restart.
-    needs_restart = sample_rate_changed or 'gain' in clean or 'ppm' in clean
+    # squelch/dwell take effect live. gain/ppm/sample_rate/rf_squelch require restart.
+    needs_restart = sample_rate_changed or 'gain' in clean or 'ppm' in clean or 'rf_squelch' in clean
     if needs_restart and scanner.running:
         scanner.stop(join_timeout=0.5)
         time.sleep(0.4)
@@ -833,14 +843,14 @@ def change_password():
     return jsonify(ok=True)
 
 
-# ── Entry Point ───────────────────────────────────────────────────────────────
+# Entry Point
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8073))
     log.info(f'RTL-SDR Scanner starting on 0.0.0.0:{port}')
     log.info(f'Config file: {CONFIG_FILE}')
     if cfg.get('must_change_password'):
-        log.warning('Default credentials in use: admin / changeme - '
+        log.warning('Default credentials in use: admin / changeme '
                     'CHANGE THE PASSWORD on first login')
     socketio.run(
         app,
