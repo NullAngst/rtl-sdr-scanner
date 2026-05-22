@@ -491,15 +491,23 @@ const player = (() => {
   let ctx = null, gain = null, nextTime = 0, vol = 0.8;
 
   function init() {
-    if (ctx) return;
-    ctx = new (window.AudioContext || window.webkitAudioContext)();
-    gain = ctx.createGain();
+    if (!ctx) {
+      ctx = new (window.AudioContext || window.webkitAudioContext)();
+      gain = ctx.createGain();
+      gain.connect(ctx.destination);
+    }
+    if (ctx.state === 'suspended') {
+      ctx.resume().catch(() => {});
+    }
     gain.gain.value = vol;
-    gain.connect(ctx.destination);
     nextTime = 0;
   }
   function stop() {
-    if (ctx) { ctx.close(); ctx = null; gain = null; }
+    try {
+      if (ctx && ctx.state !== 'closed') { 
+        ctx.suspend().catch(() => {}); 
+      }
+    } catch(e) {}
     nextTime = 0;
   }
   function setVol(v) {
@@ -517,9 +525,8 @@ const player = (() => {
       for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 32768;
       const buf = ctx.createBuffer(1, f32.length, sr);
 
-      // The server calculates silence logic based on your chosen Squelch mode and sends it as 'sq'.
       if (muteDeadAir && sq === true) {
-          // Do nothing. getChannelData initializes to an array of zeros.
+          // Do nothing
       } else {
           buf.getChannelData(0).set(f32);
       }
@@ -822,7 +829,6 @@ async function deleteFreq(idx) {
 // Settings
 function updateSquelchVis() {
   const mode = el('s-sq-mode').value;
-  tog('wrap-sq-audio', mode === 'audio');
   tog('wrap-sq-rf', mode === 'rf');
   tog('wrap-sq-diff', mode === 'diff');
   
