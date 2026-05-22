@@ -8,12 +8,7 @@
 
 services:
   rtl-sdr-scanner:
-    image: rtl-sdr-scanner:latest        # built from local Dockerfile
-    # If pulling from a registry instead, replace the line above with:
-    # image: ghcr.io/youruser/rtl-sdr-scanner:latest
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: rtl-sdr-scanner:latest
     container_name: rtl-sdr-scanner
 
     # ── Network ───────────────────────────────────────────────────────────────
