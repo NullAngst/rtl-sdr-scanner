@@ -14,6 +14,7 @@ import secrets
 import base64
 import logging
 import tempfile
+import select
 from collections import defaultdict, deque
 from functools import wraps
 
@@ -35,15 +36,13 @@ VALID_MODES = {'fm', 'am', 'usb', 'lsb', 'raw', 'wbfm'}
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', secrets.token_hex(32))
 
-# Default CORS to same-origin. Override with ALLOWED_ORIGINS env (comma-
-# separated, or "*") if you need cross-origin access for embedding.
 _origins_env = os.environ.get('ALLOWED_ORIGINS', '').strip()
 if _origins_env == '*':
     _cors_origins = '*'
 elif _origins_env:
     _cors_origins = [o.strip() for o in _origins_env.split(',') if o.strip()]
 else:
-    _cors_origins = []  # same-origin only
+    _cors_origins = []
     
 socketio = SocketIO(
     app,
@@ -59,19 +58,19 @@ CONFIG_FILE = os.environ.get('CONFIG_FILE', '/data/config.json')
 
 DEFAULTS = {
     'admin_username': 'admin',
-    # Stored as werkzeug salted hash. Default password is 'changeme'.
     'admin_password_hash': generate_password_hash('changeme'),
     'must_change_password': True,
     'frequencies': [],
+    'squelch_mode': 'audio',
     'squelch_db': -35.0,
+    'rf_squelch': 0,
+    'diff_squelch': 3.0,
     'dwell_time': 2.0,
     'sample_rate': 16000,
     'ppm': 0,
     'gain': 'auto',
-    'rf_squelch': 0,
 }
 
-# Lock protects all reads/writes of cfg and the config file on disk.
 _cfg_lock = threading.RLock()
 
 
@@ -82,24 +81,19 @@ def load_config() -> dict:
                 data = json.load(f)
             for k, v in DEFAULTS.items():
                 data.setdefault(k, v)
-            # Migrate legacy unsalted SHA-256 hashes (64 hex chars) replace
-            # with an unknowable password and force a reset on next login.
             ph = data.get('admin_password_hash', '')
             if (isinstance(ph, str) and len(ph) == 64 and
                     all(c in '0123456789abcdef' for c in ph.lower())):
-                log.warning('Legacy SHA-256 password hash detected, '
-                            'forcing password reset')
                 data['admin_password_hash'] = generate_password_hash(
                     secrets.token_hex(32))
                 data['must_change_password'] = True
             return data
         except Exception as e:
-            log.error(f'Failed to load config: {e}, using defaults')
+            log.error(f'Failed to load config: {e}')
     return dict(DEFAULTS)
 
 
 def save_config():
-    """Atomic write tmp file in same directory, fsync, then os.replace."""
     with _cfg_lock:
         try:
             directory = os.path.dirname(CONFIG_FILE) or '.'
@@ -125,11 +119,9 @@ def save_config():
 cfg = load_config()
 
 # Session Auth
-# In-memory sessions; cleared on container restart. For multi-worker or
-# persistent sessions, swap for Flask signed-cookie sessions or external store.
-_sessions: dict[str, float] = {}   # token -> expiry timestamp
+_sessions: dict[str, float] = {}
 _sessions_lock = threading.Lock()
-SESSION_TTL = 86400                 # 24 hours
+SESSION_TTL = 86400
 
 
 def create_session() -> str:
@@ -166,12 +158,10 @@ def admin_required(f):
 
 
 # Login Rate Limiting
-# Simple in-memory sliding window per client IP. Caps brute-force throughput
-# without pulling in a full rate-limit library.
 _login_attempts: dict[str, deque] = defaultdict(deque)
 _login_lock = threading.Lock()
-LOGIN_WINDOW_SECS = 300       # 5 minutes
-LOGIN_MAX_ATTEMPTS = 8        # per IP per window
+LOGIN_WINDOW_SECS = 300
+LOGIN_MAX_ATTEMPTS = 8
 
 
 def login_rate_limit_ok(ip: str) -> bool:
@@ -184,7 +174,6 @@ def login_rate_limit_ok(ip: str) -> bool:
         if len(q) >= LOGIN_MAX_ATTEMPTS:
             return False
         q.append(now)
-        # Opportunistic cleanup so memory stays bounded.
         if len(_login_attempts) > 1024:
             for k in list(_login_attempts.keys()):
                 if not _login_attempts[k]:
@@ -193,7 +182,6 @@ def login_rate_limit_ok(ip: str) -> bool:
 
 
 def client_ip() -> str:
-    # Honor X-Forwarded-For if you're behind a trusted reverse proxy.
     xff = request.headers.get('X-Forwarded-For', '')
     if xff:
         return xff.split(',')[0].strip()
@@ -212,7 +200,6 @@ def on_connect():
         _connected += 1
         count = _connected
     socketio.emit('system_stats', {'connected': count})
-    log.info(f'Client connected ({count} total)')
 
 
 @socketio.on('disconnect')
@@ -222,10 +209,8 @@ def on_disconnect():
         _connected = max(0, _connected - 1)
         count = _connected
     socketio.emit('system_stats', {'connected': count})
-    log.info(f'Client disconnected ({count} total)')
 
 
-# Audio room: only clients that enabled audio receive audio chunks.
 @socketio.on('audio_subscribe')
 def on_audio_subscribe():
     join_room('audio')
@@ -238,14 +223,7 @@ def on_audio_unsubscribe():
 
 # Scanner
 class Scanner:
-    """
-    Manages the rtl_fm subprocess and frequency-scanning loop.
-    Reads raw 16-bit PCM audio from rtl_fm, measures RMS power,
-    and advances to the next frequency after `dwell_time` seconds
-    of silence below `squelch_db`.
-    """
-
-    CHUNK_MS = 100  # Size of each read/emit chunk in milliseconds
+    CHUNK_MS = 100
 
     def __init__(self):
         self.running = False
@@ -258,8 +236,6 @@ class Scanner:
         self._proc_lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._stderr_thread: threading.Thread | None = None
-
-    # Process control
 
     def _kill_proc(self):
         with self._proc_lock:
@@ -277,8 +253,6 @@ class Scanner:
                     pass
 
     def _drain_stderr(self, proc: subprocess.Popen):
-        """Log rtl_fm stderr instead of discarding it surfaces gain errors,
-        device-busy issues, etc."""
         try:
             for raw in iter(proc.stderr.readline, b''):
                 line = raw.decode('utf-8', 'replace').rstrip()
@@ -292,17 +266,20 @@ class Scanner:
             gain = cfg.get('gain', 'auto')
             sr = str(cfg.get('sample_rate', 16000))
             ppm = str(cfg.get('ppm', 0))
-            rf_sql = str(cfg.get('rf_squelch', 0))
+            sq_mode = cfg.get('squelch_mode', 'audio')
+            
+            # Only apply RF squelch limit if the mode is actually set to RF
+            rf_sql = str(cfg.get('rf_squelch', 0)) if sq_mode == 'rf' else '0'
 
         cmd = [
             'rtl_fm',
             '-f', str(freq_hz),
             '-M', mode,
-            '-s', '200000',   # capture sample rate (200 kHz)
-            '-r', sr,         # output resample rate
-            '-p', ppm,        # PPM frequency correction
-            '-l', rf_sql,     # hardware RF squelch
-            '-'               # output to stdout
+            '-s', '200000',
+            '-r', sr,
+            '-p', ppm,
+            '-l', rf_sql,
+            '-'
         ]
         if gain != 'auto':
             cmd += ['-g', str(gain)]
@@ -322,11 +299,8 @@ class Scanner:
         self._stderr_thread.start()
         return proc
 
-    # Signal analysis
-
     @staticmethod
     def rms_db(raw: bytes) -> float:
-        """Return RMS level in dBFS from raw signed 16-bit PCM bytes."""
         if len(raw) < 2:
             return -100.0
         samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
@@ -335,26 +309,22 @@ class Scanner:
             return -100.0
         return float(20.0 * np.log10(rms / 32768.0))
 
-    # Main scan loop
-
     def _loop(self):
         consecutive_failures = 0
         while self.running:
             with _cfg_lock:
-                freqs = list(cfg.get('frequencies', []))   # snapshot
+                freqs = list(cfg.get('frequencies', []))
                 sr = cfg.get('sample_rate', 16000)
 
             if not freqs:
-                # Sleep in short slices so stop() remains responsive.
                 for _ in range(5):
-                    if not self.running:
-                        break
+                    if not self.running: break
                     time.sleep(0.1)
                 continue
 
             idx = self.current_idx % len(freqs)
             fi = freqs[idx]
-            chunk_bytes = int(sr * self.CHUNK_MS / 1000) * 2  # 16-bit = 2 B/sample
+            chunk_bytes = int(sr * self.CHUNK_MS / 1000) * 2
 
             self.current_freq = fi
             self.current_idx = idx
@@ -369,27 +339,19 @@ class Scanner:
 
             mode = fi.get('mode', 'fm')
             if mode not in VALID_MODES:
-                log.warning(f'Invalid mode {mode!r} on {fi.get("freq")}, '
-                            f'skipping')
                 self.current_idx = (idx + 1) % len(freqs)
                 time.sleep(0.2)
                 continue
 
-            log.info(f'Tuning to {fi["freq"]/1e6:.3f} MHz '
-                     f'({fi.get("label","")}) [{mode.upper()}]')
+            log.info(f'Tuning to {fi["freq"]/1e6:.3f} MHz ({fi.get("label","")}) [{mode.upper()}]')
 
             self._kill_proc()
             try:
                 proc = self._start_rtl(fi['freq'], mode)
-            except FileNotFoundError:
-                log.error('rtl_fm not found, install the rtl-sdr package')
-                self.running = False
-                break
             except Exception as e:
                 log.error(f'Failed to start rtl_fm: {e}')
                 consecutive_failures += 1
                 if consecutive_failures >= 5:
-                    log.error('Too many rtl_fm failures, stopping scanner')
                     self.running = False
                     break
                 time.sleep(1.0)
@@ -397,6 +359,8 @@ class Scanner:
 
             silence_start: float | None = None
             chunks_read = 0
+            buf = bytearray()
+            db_history = []  # Used for rolling variance calculation in diff mode
 
             while self.running:
                 if self.force_skip:
@@ -404,46 +368,94 @@ class Scanner:
                     self.current_idx = (idx + 1) % len(freqs)
                     break
 
-                try:
-                    chunk = proc.stdout.read(chunk_bytes)
-                except Exception as e:
-                    log.warning(f'rtl_fm read error: {e}')
-                    break
-
-                if not chunk:
-                    log.warning('rtl_fm process ended unexpectedly')
-                    break
-
-                chunks_read += 1
-                db = self.rms_db(chunk)
-                self.signal_db = db
-
-                # Signal level to all clients (small payload).
-                socketio.emit('signal', {'db': round(db, 1)})
-
-                # Audio only to clients that subscribed.
-                socketio.emit('audio', {
-                    'data': base64.b64encode(chunk).decode('ascii'),
-                    'sr': sr,
-                    'db': round(db, 1)
-                }, room='audio')
-
-                # Re-read squelch/dwell every chunk so live setting changes
-                # take effect without restarting rtl_fm.
                 with _cfg_lock:
-                    squelch = cfg.get('squelch_db', -35.0)
+                    sq_mode = cfg.get('squelch_mode', 'audio')
+                    sq_db = cfg.get('squelch_db', -35.0)
+                    diff_sq = cfg.get('diff_squelch', 3.0)
                     dwell = cfg.get('dwell_time', 2.0)
 
-                if db < squelch:
+                # NON-BLOCKING READ: Waits 50ms for data. If rtl_fm is blocked by 
+                # RF squelch, this prevents the thread from freezing.
+                try:
+                    ready, _, _ = select.select([proc.stdout], [], [], 0.05)
+                except Exception as e:
+                    log.warning(f"select error: {e}")
+                    break
+
+                if proc.stdout in ready:
+                    try:
+                        # Grab whatever is instantly available
+                        raw = os.read(proc.stdout.fileno(), 8192)
+                    except Exception as e:
+                        log.warning(f'rtl_fm read error: {e}')
+                        break
+
+                    if not raw:
+                        log.warning('rtl_fm process ended unexpectedly')
+                        break
+
+                    buf.extend(raw)
+                    chunks_read += 1
+
+                    # Process full chunks as they buffer up
+                    while len(buf) >= chunk_bytes:
+                        chunk = bytes(buf[:chunk_bytes])
+                        del buf[:chunk_bytes]
+
+                        db = self.rms_db(chunk)
+                        self.signal_db = db
+                        
+                        db_history.append(db)
+                        # Keep a 1-second rolling window (approx 10 chunks at 100ms)
+                        if len(db_history) > 10:
+                            db_history.pop(0)
+
+                        # Determine if this chunk is considered "Silence"
+                        is_silence = False
+                        if sq_mode == 'rf':
+                            # If we are getting audio data in RF mode, the hardware gate is open.
+                            is_silence = False
+                        elif sq_mode == 'diff':
+                            # Need a few chunks to establish a baseline
+                            if len(db_history) < 3:
+                                is_silence = True
+                            else:
+                                # A change in EITHER direction > limit breaks squelch
+                                if max(db_history) - min(db_history) >= diff_sq:
+                                    is_silence = False
+                                else:
+                                    is_silence = True
+                        else:  # 'audio'
+                            if db < sq_db:
+                                is_silence = True
+
+                        socketio.emit('signal', {'db': round(db, 1)})
+                        socketio.emit('audio', {
+                            'data': base64.b64encode(chunk).decode('ascii'),
+                            'sr': sr,
+                            'db': round(db, 1),
+                            'sq': is_silence # Inform frontend so it can mute dead air
+                        }, room='audio')
+
+                        if is_silence:
+                            if silence_start is None:
+                                silence_start = time.time()
+                        else:
+                            silence_start = None
+
+                        if silence_start is not None and not self.paused and (time.time() - silence_start) >= dwell:
+                            break  # Breaks chunk loop
+                else:
+                    # Timeout triggered - hardware RF squelch is keeping the gate closed
+                    self.signal_db = -100.0
+                    socketio.emit('signal', {'db': -100.0})
                     if silence_start is None:
                         silence_start = time.time()
-                    elif not self.paused and (time.time() - silence_start) >= dwell:
-                        log.info(f'Silence for {dwell}s on '
-                                 f'{fi["freq"]/1e6:.3f} MHz, advancing')
-                        self.current_idx = (idx + 1) % len(freqs)
-                        break
-                else:
-                    silence_start = None   # Active signal reset
+
+                if silence_start is not None and not self.paused and (time.time() - silence_start) >= dwell:
+                    log.info(f'Silence for {dwell}s on {fi["freq"]/1e6:.3f} MHz, advancing')
+                    self.current_idx = (idx + 1) % len(freqs)
+                    break
 
             self._kill_proc()
             if chunks_read > 0:
@@ -451,37 +463,29 @@ class Scanner:
             else:
                 consecutive_failures += 1
                 if consecutive_failures >= 5:
-                    log.error('rtl_fm produced no audio 5 times in a row, '
-                              'stopping scanner')
+                    log.error('rtl_fm produced no audio 5 times in a row, stopping scanner')
                     self.running = False
                     break
 
-        # Scanner stopped
         self.running = False
         self.current_freq = None
         socketio.emit('scanner_update', {'running': False})
         log.info('Scanner stopped')
 
     def start(self):
-        if self.running:
-            return
+        if self.running: return
         self.running = True
         self.current_idx = 0
-        self._thread = threading.Thread(
-            target=self._loop, daemon=True, name='scanner')
+        self._thread = threading.Thread(target=self._loop, daemon=True, name='scanner')
         self._thread.start()
-        log.info('Scanner started')
 
     def stop(self, join_timeout: float = 1.0):
         self.running = False
         self._kill_proc()
         if self._thread and self._thread is not threading.current_thread():
             self._thread.join(timeout=join_timeout)
-        log.info('Scanner stop requested')
 
     def notify_freqs_changed(self):
-        """After freq list mutation, keep current_idx aimed at the same entry
-        when possible, falling back to clamping into range."""
         with _cfg_lock:
             freqs = cfg.get('frequencies', [])
         if not freqs:
@@ -490,11 +494,7 @@ class Scanner:
         cur = self.current_freq
         if cur is not None:
             for i, f in enumerate(freqs):
-                if f is cur or (
-                    f.get('freq') == cur.get('freq') and
-                    f.get('mode') == cur.get('mode') and
-                    f.get('label') == cur.get('label')
-                ):
+                if f is cur or (f.get('freq') == cur.get('freq') and f.get('mode') == cur.get('mode') and f.get('label') == cur.get('label')):
                     self.current_idx = i
                     return
         if self.current_idx >= len(freqs):
@@ -515,9 +515,7 @@ def index():
 def login():
     ip = client_ip()
     if not login_rate_limit_ok(ip):
-        log.warning(f'Rate limit exceeded for {ip}')
-        return jsonify(
-            error='Too many attempts, try again in a few minutes'), 429
+        return jsonify(error='Too many attempts, try again in a few minutes'), 429
 
     d = request.get_json(force=True, silent=True) or {}
     username = d.get('username', '') or ''
@@ -530,7 +528,6 @@ def login():
         stored_hash = cfg['admin_password_hash']
         must_change = bool(cfg.get('must_change_password', False))
 
-    # Constant-time username compare + slow password check.
     user_ok = hmac.compare_digest(username, expected_user)
     try:
         pw_ok = check_password_hash(stored_hash, password)
@@ -539,14 +536,8 @@ def login():
 
     if user_ok and pw_ok:
         token = create_session()
-        log.info(f'Admin login: {username}')
-        return jsonify(
-            token=token,
-            username=expected_user,
-            must_change_password=must_change,
-        )
+        return jsonify(token=token, username=expected_user, must_change_password=must_change)
 
-    log.warning(f'Failed login for user={username!r} from {ip}')
     return jsonify(error='Invalid credentials'), 401
 
 
@@ -559,7 +550,6 @@ def logout():
 
 @app.route('/api/verify', methods=['GET'])
 def verify():
-    """Check if a token is still valid used on page load."""
     token = request.headers.get('X-Token', '')
     if is_valid_token(token):
         with _cfg_lock:
@@ -572,7 +562,7 @@ def verify():
 def status():
     with _cfg_lock:
         freqs = list(cfg.get('frequencies', []))
-        squelch = cfg.get('squelch_db', -35.0)
+        sq_mode = cfg.get('squelch_mode', 'audio')
     with _connected_lock:
         conn = _connected
     return jsonify(
@@ -581,13 +571,11 @@ def status():
         current_freq=scanner.current_freq,
         current_idx=scanner.current_idx,
         signal_db=round(scanner.signal_db, 1),
-        squelch_db=squelch,
+        squelch_mode=sq_mode,
         frequencies=freqs,
         connected=conn,
     )
 
-
-# Frequency Management
 
 @app.route('/api/frequencies', methods=['GET'])
 def get_freqs():
@@ -607,14 +595,11 @@ def add_freq():
     except (ValueError, TypeError):
         return jsonify(error='freq must be an integer (Hz)'), 400
     if freq < 500_000 or freq > 1_750_000_000:
-        return jsonify(
-            error='freq out of RTL-SDR range (0.5 MHz to 1750 MHz)'), 400
+        return jsonify(error='freq out of RTL-SDR range (0.5 MHz - 1750 MHz)'), 400
 
     mode = str(d.get('mode', 'fm')).lower().strip()
     if mode not in VALID_MODES:
-        return jsonify(
-            error=f'mode must be one of: {", ".join(sorted(VALID_MODES))}'
-        ), 400
+        return jsonify(error=f'mode must be one of: {", ".join(sorted(VALID_MODES))}'), 400
 
     label = d.get('label')
     if label is not None:
@@ -630,7 +615,6 @@ def add_freq():
         save_config()
 
     socketio.emit('frequencies_updated', freqs_snapshot)
-    log.info(f'Added frequency: {entry}')
     return jsonify(entry), 201
 
 
@@ -647,9 +631,7 @@ def update_freq(idx):
         if 'mode' in d:
             mode = str(d['mode']).lower().strip()
             if mode not in VALID_MODES:
-                return jsonify(
-                    error=f'mode must be one of: '
-                          f'{", ".join(sorted(VALID_MODES))}'), 400
+                return jsonify(error='Invalid mode'), 400
             freqs[idx]['mode'] = mode
         updated = dict(freqs[idx])
         freqs_snapshot = list(freqs)
@@ -672,11 +654,8 @@ def del_freq(idx):
 
     scanner.notify_freqs_changed()
     socketio.emit('frequencies_updated', freqs_snapshot)
-    log.info(f'Removed frequency: {removed}')
     return jsonify(removed)
 
-
-# Scanner Control
 
 @app.route('/api/scanner/start', methods=['POST'])
 @admin_required
@@ -692,7 +671,6 @@ def start_scanner():
 @app.route('/api/scanner/stop', methods=['POST'])
 @admin_required
 def stop_scanner():
-    # Don't block the HTTP worker on thread join.
     scanner.stop(join_timeout=0.5)
     return jsonify(running=False)
 
@@ -719,45 +697,56 @@ def skip_scanner():
 
 
 # Settings
-
-SETTINGS_KEYS = ('squelch_db', 'dwell_time', 'sample_rate', 'ppm', 'gain', 'rf_squelch')
+SETTINGS_KEYS = (
+    'squelch_mode', 'squelch_db', 'rf_squelch', 'diff_squelch',
+    'dwell_time', 'sample_rate', 'ppm', 'gain'
+)
 
 
 def _coerce_settings(d: dict) -> tuple[dict, str | None]:
-    """Validate and coerce settings; return (clean_dict, error_or_none)."""
     out: dict = {}
+    if 'squelch_mode' in d:
+        v = str(d['squelch_mode']).lower()
+        if v in ('audio', 'rf', 'diff'):
+            out['squelch_mode'] = v
+        else:
+            return {}, 'Invalid squelch mode'
     if 'squelch_db' in d:
         try:
             v = float(d['squelch_db'])
-        except (ValueError, TypeError):
-            return {}, 'squelch_db must be a number'
-        if not -120 <= v <= 0:
-            return {}, 'squelch_db must be between -120 and 0'
-        out['squelch_db'] = v
+            if not -120 <= v <= 0: return {}, 'squelch_db must be between -120 and 0'
+            out['squelch_db'] = v
+        except (ValueError, TypeError): return {}, 'squelch_db must be a number'
+    if 'rf_squelch' in d:
+        try:
+            v = int(d['rf_squelch'])
+            if not 0 <= v <= 1000: return {}, 'rf_squelch must be between 0 and 1000'
+            out['rf_squelch'] = v
+        except (ValueError, TypeError): return {}, 'rf_squelch must be an integer'
+    if 'diff_squelch' in d:
+        try:
+            v = float(d['diff_squelch'])
+            if not 0.1 <= v <= 50.0: return {}, 'diff_squelch must be between 0.1 and 50'
+            out['diff_squelch'] = v
+        except (ValueError, TypeError): return {}, 'diff_squelch must be a number'
     if 'dwell_time' in d:
         try:
             v = float(d['dwell_time'])
-        except (ValueError, TypeError):
-            return {}, 'dwell_time must be a number'
-        if not 0.1 <= v <= 600:
-            return {}, 'dwell_time must be between 0.1 and 600 seconds'
-        out['dwell_time'] = v
+            if not 0.1 <= v <= 600: return {}, 'dwell_time must be between 0.1 and 600'
+            out['dwell_time'] = v
+        except (ValueError, TypeError): return {}, 'dwell_time must be a number'
     if 'sample_rate' in d:
         try:
             v = int(d['sample_rate'])
-        except (ValueError, TypeError):
-            return {}, 'sample_rate must be an integer'
-        if v not in (8000, 16000, 22050, 24000, 32000, 44100, 48000):
-            return {}, 'sample_rate must be a common audio rate'
-        out['sample_rate'] = v
+            if v not in (8000, 16000, 22050, 24000, 32000, 44100, 48000): return {}, 'Invalid sample_rate'
+            out['sample_rate'] = v
+        except (ValueError, TypeError): return {}, 'sample_rate must be an integer'
     if 'ppm' in d:
         try:
             v = int(d['ppm'])
-        except (ValueError, TypeError):
-            return {}, 'ppm must be an integer'
-        if not -200 <= v <= 200:
-            return {}, 'ppm must be between -200 and 200'
-        out['ppm'] = v
+            if not -200 <= v <= 200: return {}, 'ppm must be between -200 and 200'
+            out['ppm'] = v
+        except (ValueError, TypeError): return {}, 'ppm must be an integer'
     if 'gain' in d:
         g = str(d['gain']).strip().lower()
         if g == 'auto':
@@ -765,19 +754,9 @@ def _coerce_settings(d: dict) -> tuple[dict, str | None]:
         else:
             try:
                 gv = float(g)
-            except ValueError:
-                return {}, 'gain must be "auto" or a number'
-            if not 0 <= gv <= 100:
-                return {}, 'gain must be between 0 and 100 dB'
-            out['gain'] = g  # keep original string form for rtl_fm
-    if 'rf_squelch' in d:
-        try:
-            v = int(d['rf_squelch'])
-        except (ValueError, TypeError):
-            return {}, 'rf_squelch must be an integer'
-        if not 0 <= v <= 1000:
-            return {}, 'rf_squelch must be between 0 and 1000'
-        out['rf_squelch'] = v
+                if not 0 <= gv <= 100: return {}, 'gain must be between 0 and 100 dB'
+                out['gain'] = g
+            except ValueError: return {}, 'gain must be "auto" or a number'
     return out, None
 
 
@@ -806,8 +785,7 @@ def update_settings():
         if clean:
             save_config()
 
-    # squelch/dwell take effect live. gain/ppm/sample_rate/rf_squelch require restart.
-    needs_restart = sample_rate_changed or 'gain' in clean or 'ppm' in clean or 'rf_squelch' in clean
+    needs_restart = sample_rate_changed or 'gain' in clean or 'ppm' in clean or 'rf_squelch' in clean or 'squelch_mode' in clean
     if needs_restart and scanner.running:
         scanner.stop(join_timeout=0.5)
         time.sleep(0.4)
@@ -823,8 +801,6 @@ def change_password():
     pw = d.get('password', '')
     if not isinstance(pw, str) or len(pw) < 8:
         return jsonify(error='Password must be at least 8 characters'), 400
-    if len(pw) > 256:
-        return jsonify(error='Password too long'), 400
 
     new_hash = generate_password_hash(pw)
     with _cfg_lock:
@@ -832,26 +808,20 @@ def change_password():
         cfg['must_change_password'] = False
         save_config()
 
-    # Invalidate all other sessions on password change.
     cur_token = request.headers.get('X-Token', '')
     with _sessions_lock:
         for t in list(_sessions.keys()):
             if t != cur_token:
                 _sessions.pop(t, None)
 
-    log.info('Admin password changed (other sessions invalidated)')
     return jsonify(ok=True)
 
-
-# Entry Point
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8073))
     log.info(f'RTL-SDR Scanner starting on 0.0.0.0:{port}')
-    log.info(f'Config file: {CONFIG_FILE}')
     if cfg.get('must_change_password'):
-        log.warning('Default credentials in use: admin / changeme '
-                    'CHANGE THE PASSWORD on first login')
+        log.warning('Default credentials in use: admin / changeme - CHANGE PASSWORD ON FIRST LOGIN')
     socketio.run(
         app,
         host='0.0.0.0',
