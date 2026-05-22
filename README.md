@@ -68,22 +68,14 @@ Copy the output - you will paste it into the stack configuration in the next ste
 1. Open Portainer and navigate to **Stacks > Add stack**
 2. Give the stack a name, e.g. `rtl-sdr-scanner`
 3. Choose **Web editor** and paste the contents of `docker-compose.yml` directly.
-4. **Delete the `build` block** from the YAML configuration since you already built the image. Ensure your service definition uses the local image:
-   ```yaml
-   services:
-     rtl-sdr-scanner:
-       image: rtl-sdr-scanner:latest
-       container_name: rtl-sdr-scanner
-       # ... keep the rest of your configuration
-   ```
-5. Under **Environment variables**, add:
+4. Under **Environment variables**, add:
 
    | Variable | Value |
    |---|---|
    | `SECRET_KEY` | The hex string you generated above |
    | `HOST_PORT` | The port you want to access the UI on (default: `8073`) |
 
-6. Click **Deploy the stack**
+5. Click **Deploy the stack**
 
 Portainer will pull the local image from your Docker cache and start the container.
 
