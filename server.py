@@ -224,6 +224,7 @@ def on_audio_unsubscribe():
 # Scanner
 class Scanner:
     CHUNK_MS = 100
+    TUNE_GRACE = 3.0  # seconds allowed for rtl_fm/dongle startup before the silence clock may run
 
     def __init__(self):
         self.running = False
@@ -359,6 +360,7 @@ class Scanner:
 
             silence_start: float | None = None
             chunks_read = 0
+            tuned_at = time.time()
             buf = bytearray()
             db_history = []  # Used for rolling variance calculation in diff mode
 
@@ -410,27 +412,30 @@ class Scanner:
                         if len(db_history) > 10:
                             db_history.pop(0)
 
-                        # Determine if this chunk is considered "Silence"
-                        is_silence = False
-                        
-                        # Apply absolute squelch floor for all modes
-                        if db < sq_db:
-                            is_silence = True
-                        elif sq_mode == 'rf':
-                            # If we are getting audio data in RF mode and passed db check, gate is open.
+                        # Determine if this chunk is considered "Silence".
+                        # NOTE: the absolute dBFS floor applies ONLY in
+                        # 'audio' mode. Applying it to all modes breaks
+                        # 'diff' mode completely: diff mode exists for FM
+                        # quieting, where real voice on a strong carrier is
+                        # QUIETER than open static. A -35 dBFS floor there
+                        # flags every chunk of real audio as silence, so the
+                        # frontend mutes everything and the scanner advances
+                        # every dwell period.
+                        if sq_mode == 'rf':
+                            # Data flowing at all means the hardware gate is
+                            # open (rtl_fm -l blocks output when squelched).
                             is_silence = False
                         elif sq_mode == 'diff':
-                            # Need a few chunks to establish a baseline
                             if len(db_history) < 3:
-                                is_silence = True
+                                # Warm-up: not enough history to judge.
+                                # Treat as signal so a freshly tuned channel
+                                # is never skipped before it can be measured.
+                                is_silence = False
                             else:
-                                # A change in EITHER direction > limit breaks squelch
-                                if max(db_history) - min(db_history) >= diff_sq:
-                                    is_silence = False
-                                else:
-                                    is_silence = True
+                                # A swing in EITHER direction >= limit breaks squelch
+                                is_silence = (max(db_history) - min(db_history)) < diff_sq
                         else:  # 'audio'
-                            is_silence = False
+                            is_silence = db < sq_db
 
                         socketio.emit('signal', {'db': round(db, 1)})
                         socketio.emit('audio', {
@@ -449,10 +454,18 @@ class Scanner:
                         if silence_start is not None and not self.paused and (time.time() - silence_start) >= dwell:
                             break  # Breaks chunk loop
                 else:
-                    # Timeout triggered - hardware RF squelch is keeping the gate closed
+                    # No data within 50ms. Either rtl_fm is still starting up
+                    # (dongle init/tune takes 1-3s) or the hardware RF squelch
+                    # is holding the gate closed. Do NOT start the silence
+                    # clock during startup: doing so means the dwell timer has
+                    # often already expired before rtl_fm emits its first
+                    # sample, so the scanner hops channels forever with the
+                    # meter pinned at -100.
                     self.signal_db = -100.0
                     socketio.emit('signal', {'db': -100.0})
-                    if silence_start is None:
+                    if silence_start is None and (
+                            chunks_read > 0 or
+                            (time.time() - tuned_at) >= self.TUNE_GRACE):
                         silence_start = time.time()
 
                 if silence_start is not None and not self.paused and (time.time() - silence_start) >= dwell:
@@ -460,15 +473,21 @@ class Scanner:
                     self.current_idx = (idx + 1) % len(freqs)
                     break
 
+            proc_exited = proc.poll() is not None
             self._kill_proc()
             if chunks_read > 0:
                 consecutive_failures = 0
-            else:
+            elif proc_exited:
+                # Process died without ever producing audio - a real failure
+                # (no dongle, device busy, bad args, ...).
                 consecutive_failures += 1
                 if consecutive_failures >= 5:
                     log.error('rtl_fm produced no audio 5 times in a row, stopping scanner')
                     self.running = False
                     break
+            # else: rtl_fm was alive but hardware-squelched the whole dwell.
+            # A quiet channel is not a failure; don't count it, or scanning a
+            # list of idle channels in RF mode kills the scanner after five.
 
         self.running = False
         self.current_freq = None
