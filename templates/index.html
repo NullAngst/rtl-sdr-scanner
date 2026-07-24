@@ -536,7 +536,11 @@ const player = (() => {
       src.connect(gain);
       const now = ctx.currentTime;
       if (nextTime < now + 0.04)  nextTime = now + 0.04;
-      if (nextTime > now + 0.3)   nextTime = now + 0.04;
+      // The server now reads rtl_fm in bursts (several 100ms chunks arrive
+      // at once), so the schedule legitimately runs ~0.3-0.5s ahead of the
+      // clock. The old 0.3s cap made burst chunks restart at now+0.04 and
+      // play on top of the previous ones. Only resync on real drift.
+      if (nextTime > now + 1.0)   nextTime = now + 0.04;
       src.start(nextTime);
       nextTime += buf.duration;
     } catch(e) { }
