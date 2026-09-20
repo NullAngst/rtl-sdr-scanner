@@ -13,6 +13,7 @@ import hmac
 import secrets
 import base64
 import logging
+import shutil
 import tempfile
 import select
 from collections import defaultdict, deque
@@ -126,8 +127,14 @@ SESSION_TTL = 86400
 
 def create_session() -> str:
     token = secrets.token_hex(32)
+    now = time.time()
     with _sessions_lock:
-        _sessions[token] = time.time() + SESSION_TTL
+        # Expired tokens were only dropped when someone happened to present
+        # them, so the table grew forever.
+        for t, exp in list(_sessions.items()):
+            if exp <= now:
+                del _sessions[t]
+        _sessions[token] = now + SESSION_TTL
     return token
 
 
@@ -192,6 +199,17 @@ def client_ip() -> str:
 _connected = 0
 _connected_lock = threading.Lock()
 
+# sids currently in the 'audio' room. Base64-encoding and emitting every
+# 100 ms chunk when nobody is listening is pure waste, and it used to happen
+# on every scan.
+_audio_sids: set[str] = set()
+_audio_lock = threading.Lock()
+
+
+def has_audio_listeners() -> bool:
+    with _audio_lock:
+        return bool(_audio_sids)
+
 
 @socketio.on('connect')
 def on_connect():
@@ -203,28 +221,41 @@ def on_connect():
 
 
 @socketio.on('disconnect')
-def on_disconnect():
+def on_disconnect(*args):
+    # Flask-SocketIO >= 5.5 passes a disconnect reason. Accept it either way.
     global _connected
     with _connected_lock:
         _connected = max(0, _connected - 1)
         count = _connected
+    with _audio_lock:
+        _audio_sids.discard(request.sid)
     socketio.emit('system_stats', {'connected': count})
 
 
 @socketio.on('audio_subscribe')
 def on_audio_subscribe():
     join_room('audio')
+    with _audio_lock:
+        _audio_sids.add(request.sid)
 
 
 @socketio.on('audio_unsubscribe')
 def on_audio_unsubscribe():
     leave_room('audio')
+    with _audio_lock:
+        _audio_sids.discard(request.sid)
 
 
 # Scanner
+RTL_FM_BIN = shutil.which('rtl_fm') or 'rtl_fm'
+
+SIGNAL_EMIT_INTERVAL = 0.1  # seconds; meter updates are capped at 10 Hz
+
+
 class Scanner:
     CHUNK_MS = 100
-    TUNE_GRACE = 3.0  # seconds allowed for rtl_fm/dongle startup before the silence clock may run
+    TUNE_GRACE = 3.0   # seconds allowed for rtl_fm/dongle startup before the silence clock may run
+    NO_DATA_GAP = 0.4  # seconds without any bytes before the channel counts as dead air
 
     def __init__(self):
         self.running = False
@@ -233,10 +264,16 @@ class Scanner:
         self.current_idx = 0
         self.current_freq: dict | None = None
         self.signal_db = -100.0
+        self.last_error: str | None = None
         self._proc: subprocess.Popen | None = None
         self._proc_lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._stderr_thread: threading.Thread | None = None
+        self._last_stderr: str = ''
+        # Bumped on every start/stop. A loop whose generation no longer
+        # matches is a leftover and must exit without touching shared state.
+        self._gen = 0
+        self._life_lock = threading.Lock()
 
     def _kill_proc(self):
         with self._proc_lock:
@@ -259,31 +296,68 @@ class Scanner:
                 line = raw.decode('utf-8', 'replace').rstrip()
                 if line:
                     log.info(f'rtl_fm: {line}')
+                    low = line.lower()
+                    if any(k in low for k in (
+                            'error', 'failed', 'no supported', 'not found',
+                            'busy', 'cannot', 'unable', 'usb_')):
+                        self._last_stderr = line
         except Exception:
             pass
+
+    # Demodulation bandwidth we aim for, per mode, in Hz.
+    #
+    # The old command hardcoded `-s 200000` for every mode. That is the
+    # broadcast-FM recipe and it is wrong for everything else here: it
+    # demodulates a 200 kHz slice for a 12.5/25 kHz NBFM channel, so the
+    # wanted signal is buried under ~10x its own bandwidth of noise and the
+    # audio comes out weak and hissy. On AM/USB/LSB it is useless.
+    #
+    # It also broke the resampler. rtl_fm's `low_pass_real` averages with
+    # `rate_in / rate_out` using *integer* division, so 200000 -> 16000
+    # (12.5) divides sums of 12.5 samples by 12: wrong gain plus distortion.
+    # Rates below are always an exact integer multiple of the output rate.
+    TARGET_BW = {
+        'fm': 16000,
+        'am': 16000,
+        'usb': 16000,
+        'lsb': 16000,
+        'raw': 16000,
+        'wbfm': 170000,
+    }
+
+    @classmethod
+    def rates_for(cls, mode: str, out_rate: int) -> tuple[int, int]:
+        target = cls.TARGET_BW.get(mode, 16000)
+        mult = max(1, round(target / out_rate))
+        return out_rate * mult, out_rate
 
     def _start_rtl(self, freq_hz: int, mode: str = 'fm') -> subprocess.Popen:
         with _cfg_lock:
             gain = cfg.get('gain', 'auto')
-            sr = str(cfg.get('sample_rate', 16000))
+            out_rate = int(cfg.get('sample_rate', 16000))
             ppm = str(cfg.get('ppm', 0))
             sq_mode = cfg.get('squelch_mode', 'audio')
-            
+
             # Only apply RF squelch limit if the mode is actually set to RF
             rf_sql = str(cfg.get('rf_squelch', 0)) if sq_mode == 'rf' else '0'
 
+        demod_rate, out_rate = self.rates_for(mode, out_rate)
+
+        # -M must come before -s: rtl_fm's wbfm preset sets its own rate_in,
+        # and we want our value to win.
         cmd = [
-            'rtl_fm',
+            RTL_FM_BIN,
             '-f', str(freq_hz),
             '-M', mode,
-            '-s', '200000',
-            '-r', sr,
+            '-s', str(demod_rate),
             '-p', ppm,
             '-l', rf_sql,
-            '-'
         ]
+        if demod_rate != out_rate:
+            cmd += ['-r', str(out_rate)]
         if gain != 'auto':
             cmd += ['-g', str(gain)]
+        cmd.append('-')
 
         log.info(f'Starting rtl_fm: {" ".join(cmd)}')
         proc = subprocess.Popen(
@@ -310,16 +384,20 @@ class Scanner:
             return -100.0
         return float(20.0 * np.log10(rms / 32768.0))
 
-    def _loop(self):
+    def _alive(self, gen: int) -> bool:
+        return self.running and self._gen == gen
+
+    def _loop(self, gen: int):
         consecutive_failures = 0
-        while self.running:
+        last_sig_emit = 0.0
+        while self._alive(gen):
             with _cfg_lock:
                 freqs = list(cfg.get('frequencies', []))
                 sr = cfg.get('sample_rate', 16000)
 
             if not freqs:
                 for _ in range(5):
-                    if not self.running: break
+                    if not self._alive(gen): break
                     time.sleep(0.1)
                 continue
 
@@ -351,9 +429,9 @@ class Scanner:
                 proc = self._start_rtl(fi['freq'], mode)
             except Exception as e:
                 log.error(f'Failed to start rtl_fm: {e}')
+                self.last_error = f'Failed to start rtl_fm: {e}'
                 consecutive_failures += 1
                 if consecutive_failures >= 5:
-                    self.running = False
                     break
                 time.sleep(1.0)
                 continue
@@ -361,10 +439,11 @@ class Scanner:
             silence_start: float | None = None
             chunks_read = 0
             tuned_at = time.time()
+            last_data_at = tuned_at
             buf = bytearray()
             db_history = []  # Used for rolling variance calculation in diff mode
 
-            while self.running:
+            while self._alive(gen):
                 if self.force_skip:
                     self.force_skip = False
                     self.current_idx = (idx + 1) % len(freqs)
@@ -398,6 +477,7 @@ class Scanner:
 
                     buf.extend(raw)
                     chunks_read += 1
+                    last_data_at = time.time()
 
                     # Process full chunks as they buffer up
                     while len(buf) >= chunk_bytes:
@@ -437,13 +517,18 @@ class Scanner:
                         else:  # 'audio'
                             is_silence = db < sq_db
 
-                        socketio.emit('signal', {'db': round(db, 1)})
-                        socketio.emit('audio', {
-                            'data': base64.b64encode(chunk).decode('ascii'),
-                            'sr': sr,
-                            'db': round(db, 1),
-                            'sq': is_silence # Inform frontend so it can mute dead air
-                        }, room='audio')
+                        now = time.time()
+                        if now - last_sig_emit >= SIGNAL_EMIT_INTERVAL:
+                            last_sig_emit = now
+                            socketio.emit('signal', {'db': round(db, 1)})
+
+                        if has_audio_listeners():
+                            socketio.emit('audio', {
+                                'data': base64.b64encode(chunk).decode('ascii'),
+                                'sr': sr,
+                                'db': round(db, 1),
+                                'sq': is_silence  # Inform frontend so it can mute dead air
+                            }, room='audio')
 
                         if is_silence:
                             if silence_start is None:
@@ -454,26 +539,49 @@ class Scanner:
                         if silence_start is not None and not self.paused and (time.time() - silence_start) >= dwell:
                             break  # Breaks chunk loop
                 else:
-                    # No data within 50ms. Either rtl_fm is still starting up
-                    # (dongle init/tune takes 1-3s) or the hardware RF squelch
-                    # is holding the gate closed. Do NOT start the silence
-                    # clock during startup: doing so means the dwell timer has
-                    # often already expired before rtl_fm emits its first
-                    # sample, so the scanner hops channels forever with the
-                    # meter pinned at -100.
-                    self.signal_db = -100.0
-                    socketio.emit('signal', {'db': -100.0})
-                    if silence_start is None and (
-                            chunks_read > 0 or
-                            (time.time() - tuned_at) >= self.TUNE_GRACE):
-                        silence_start = time.time()
+                    # Nothing within the select timeout. That is NOT by itself
+                    # dead air: rtl_fm writes in bursts, so gaps of one or two
+                    # timeouts happen constantly on a perfectly live channel.
+                    # Treating each one as silence pinned the meter to -100
+                    # between bursts and, in diff mode, wiped the rolling
+                    # window every time.
+                    #
+                    # A sustained gap means one of two things: rtl_fm is still
+                    # starting up (dongle init and tune take 1-3s), or the
+                    # hardware RF squelch is holding the gate closed. Only the
+                    # second one is dead air, hence the startup grace: without
+                    # it the dwell timer expires before the first sample ever
+                    # arrives and the scanner hops forever.
+                    now = time.time()
+                    gap = now - last_data_at
+                    if gap >= self.NO_DATA_GAP:
+                        self.signal_db = -100.0
+                        db_history.clear()
+                        if now - last_sig_emit >= SIGNAL_EMIT_INTERVAL:
+                            last_sig_emit = now
+                            socketio.emit('signal', {'db': -100.0})
+                        if silence_start is None and (
+                                chunks_read > 0 or
+                                (now - tuned_at) >= self.TUNE_GRACE):
+                            silence_start = now
 
                 if silence_start is not None and not self.paused and (time.time() - silence_start) >= dwell:
                     log.info(f'Silence for {dwell}s on {fi["freq"]/1e6:.3f} MHz, advancing')
                     self.current_idx = (idx + 1) % len(freqs)
                     break
 
-            proc_exited = proc.poll() is not None
+            # Did rtl_fm die on its own, or are we killing it to retune?
+            # poll() right after EOF often still reports None (the pipe closes
+            # before the child is reaped), which made the failure counter miss
+            # most real failures. Only worth a short wait when the channel
+            # produced nothing at all.
+            proc_exited = False
+            if chunks_read == 0:
+                try:
+                    proc.wait(timeout=0.25)
+                    proc_exited = True
+                except subprocess.TimeoutExpired:
+                    proc_exited = False
             self._kill_proc()
             if chunks_read > 0:
                 consecutive_failures = 0
@@ -481,31 +589,79 @@ class Scanner:
                 # Process died without ever producing audio - a real failure
                 # (no dongle, device busy, bad args, ...).
                 consecutive_failures += 1
+                detail = self._last_stderr.strip()
+                self.last_error = (
+                    'rtl_fm exited without producing audio'
+                    + (f': {detail}' if detail else
+                       ' - check that the dongle is attached and not claimed '
+                       'by another process')
+                )
                 if consecutive_failures >= 5:
                     log.error('rtl_fm produced no audio 5 times in a row, stopping scanner')
-                    self.running = False
                     break
             # else: rtl_fm was alive but hardware-squelched the whole dwell.
             # A quiet channel is not a failure; don't count it, or scanning a
             # list of idle channels in RF mode kills the scanner after five.
 
-        self.running = False
+        # Only the current generation owns the shared state. A superseded
+        # thread must not flip `running` off under a scanner that has already
+        # been restarted.
+        with self._life_lock:
+            if self._gen == gen:
+                self.running = False
+                self.current_freq = None
+                socketio.emit('scanner_update', {'running': False})
+        log.info('Scanner loop exited')
+
+    def start(self) -> tuple[bool, str | None]:
+        with self._life_lock:
+            if self.running and self._thread and self._thread.is_alive():
+                return True, None
+
+            # Two live scanner threads means two rtl_fm processes fighting
+            # over one dongle: the second one fails with a device-busy error
+            # and the whole thing goes quiet. Make sure the old thread is
+            # really gone first. The previous code only waited 0.5s on stop
+            # and then started a second thread regardless.
+            self.running = False
+            self._gen += 1
+            self._kill_proc()
+            prev = self._thread
+        if prev and prev.is_alive() and prev is not threading.current_thread():
+            prev.join(timeout=5.0)
+            if prev.is_alive():
+                log.error('Previous scanner thread did not exit; refusing to start')
+                return False, 'Previous scan did not shut down; try again'
+
+        if not shutil.which(RTL_FM_BIN) and not os.path.exists(RTL_FM_BIN):
+            return False, 'rtl_fm not found in the container'
+
+        with self._life_lock:
+            self._gen += 1
+            gen = self._gen
+            self.running = True
+            self.paused = False
+            self.force_skip = False
+            self.last_error = None
+            self.current_idx = 0
+            self._thread = threading.Thread(
+                target=self._loop, args=(gen,), daemon=True, name='scanner')
+            self._thread.start()
+        return True, None
+
+    def stop(self, join_timeout: float = 5.0):
+        with self._life_lock:
+            self.running = False
+            self._gen += 1
+            self._kill_proc()
+            t = self._thread
+        if t and t is not threading.current_thread():
+            t.join(timeout=join_timeout)
         self.current_freq = None
+        self.signal_db = -100.0
+        # stop() bumped the generation, so the exiting loop will not announce
+        # this. Announce it here or the UI sits on a stale SCANNING state.
         socketio.emit('scanner_update', {'running': False})
-        log.info('Scanner stopped')
-
-    def start(self):
-        if self.running: return
-        self.running = True
-        self.current_idx = 0
-        self._thread = threading.Thread(target=self._loop, daemon=True, name='scanner')
-        self._thread.start()
-
-    def stop(self, join_timeout: float = 1.0):
-        self.running = False
-        self._kill_proc()
-        if self._thread and self._thread is not threading.current_thread():
-            self._thread.join(timeout=join_timeout)
 
     def notify_freqs_changed(self):
         with _cfg_lock:
@@ -550,7 +706,10 @@ def login():
         stored_hash = cfg['admin_password_hash']
         must_change = bool(cfg.get('must_change_password', False))
 
-    user_ok = hmac.compare_digest(username, expected_user)
+    # compare_digest raises TypeError on non-ASCII str input, which would
+    # turn a junk username into a 500 instead of a 401.
+    user_ok = hmac.compare_digest(
+        username.encode('utf-8'), str(expected_user).encode('utf-8'))
     try:
         pw_ok = check_password_hash(stored_hash, password)
     except Exception:
@@ -594,6 +753,7 @@ def status():
         current_idx=scanner.current_idx,
         signal_db=round(scanner.signal_db, 1),
         squelch_mode=sq_mode,
+        last_error=scanner.last_error,
         frequencies=freqs,
         connected=conn,
     )
@@ -636,6 +796,7 @@ def add_freq():
         freqs_snapshot = list(cfg['frequencies'])
         save_config()
 
+    scanner.notify_freqs_changed()
     socketio.emit('frequencies_updated', freqs_snapshot)
     return jsonify(entry), 201
 
@@ -659,6 +820,7 @@ def update_freq(idx):
         freqs_snapshot = list(freqs)
         save_config()
 
+    scanner.notify_freqs_changed()
     socketio.emit('frequencies_updated', freqs_snapshot)
     return jsonify(updated)
 
@@ -686,14 +848,16 @@ def start_scanner():
         has_freqs = bool(cfg.get('frequencies'))
     if not has_freqs:
         return jsonify(error='No frequencies configured'), 400
-    scanner.start()
+    ok, err = scanner.start()
+    if not ok:
+        return jsonify(error=err or 'Failed to start scanner'), 500
     return jsonify(running=True)
 
 
 @app.route('/api/scanner/stop', methods=['POST'])
 @admin_required
 def stop_scanner():
-    scanner.stop(join_timeout=0.5)
+    scanner.stop()
     return jsonify(running=False)
 
 
@@ -701,11 +865,13 @@ def stop_scanner():
 @admin_required
 def pause_scanner():
     scanner.paused = not scanner.paused
+    with _cfg_lock:
+        total = len(cfg.get('frequencies', []))
     socketio.emit('scanner_update', {
         'running': scanner.running,
         'paused': scanner.paused,
         'idx': scanner.current_idx,
-        'total': len(cfg.get('frequencies', [])),
+        'total': total,
         'freq': scanner.current_freq,
     })
     return jsonify(paused=scanner.paused)
@@ -809,9 +975,12 @@ def update_settings():
 
     needs_restart = sample_rate_changed or 'gain' in clean or 'ppm' in clean or 'rf_squelch' in clean or 'squelch_mode' in clean
     if needs_restart and scanner.running:
-        scanner.stop(join_timeout=0.5)
-        time.sleep(0.4)
-        scanner.start()
+        # stop() now joins the worker, so start() cannot race a thread that is
+        # still holding the dongle open.
+        scanner.stop()
+        ok, err = scanner.start()
+        if not ok:
+            return jsonify(error=err or 'Settings saved but scanner restart failed'), 500
 
     return jsonify(ok=True)
 
@@ -842,6 +1011,9 @@ def change_password():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8073))
     log.info(f'RTL-SDR Scanner starting on 0.0.0.0:{port}')
+    if not shutil.which('rtl_fm'):
+        log.error('rtl_fm not found on PATH - the scanner will not produce audio. '
+                  'Install the rtl-sdr package (or rebuild the image).')
     if cfg.get('must_change_password'):
         log.warning('Default credentials in use: admin / changeme - CHANGE PASSWORD ON FIRST LOGIN')
     socketio.run(
