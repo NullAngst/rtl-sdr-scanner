@@ -258,7 +258,13 @@ rtl_fm  (system binary from rtl-sdr package)
 RTL-SDR Dongle
 ```
 
-The scanner runs in a background thread. It spawns `rtl_fm` as a subprocess and reads raw signed 16-bit PCM from its stdout in 100ms chunks. Each chunk is measured for RMS power (via NumPy), compared to the squelch threshold, and emitted to all connected browsers as a base64-encoded binary blob via Socket.IO. The browser decodes the PCM and schedules it through the Web Audio API for gapless playback.
+The scanner runs in a background thread. It spawns `rtl_fm` as a subprocess and reads raw signed 16-bit PCM from its stdout, buffering it into 100ms chunks. Each chunk is measured for RMS power (via NumPy), compared to the squelch threshold, and emitted to subscribed browsers as a base64-encoded binary blob via Socket.IO. The browser decodes the PCM and schedules it through the Web Audio API for gapless playback.
+
+`rtl_fm` is invoked with a demodulation bandwidth chosen per mode (~16 kHz for `fm`/`am`/`usb`/`lsb`, ~170 kHz for `wbfm`) and always at an exact integer multiple of the output sample rate, because `rtl_fm`'s resampler computes its averaging window with integer division. A non-integer ratio costs both level and quality.
+
+`raw` mode emits interleaved I/Q rather than audio. The squelch meter and browser player both treat it as mono PCM, so it is useful for capture, not for listening.
+
+Reads are non-blocking (`select` with a 50ms timeout). A single empty timeout is normal, since `rtl_fm` writes in bursts; only a sustained gap of 0.4s counts as dead air. That matters in `rf` mode, where `rtl_fm` emits nothing at all while the hardware gate is closed.
 
 ---
 
