@@ -321,8 +321,8 @@ input[type=range]::-moz-range-thumb { width: 13px; height: 13px; background: var
           ENABLE AUDIO
         </button>
         <div>
-          <button class="btn btn-primary" id="btn-mute-dead" onclick="toggleMuteDeadAir()" style="width:100%">
-            MUTE DEAD AIR: ON
+          <button class="btn btn-amber" id="btn-mute-dead" onclick="toggleMuteDeadAir()" style="width:100%">
+            MUTE DEAD AIR: OFF
           </button>
           <div class="help-text">When ON, the browser will force absolute silence whenever your selected Squelch Mode considers the channel inactive.</div>
         </div>
@@ -484,7 +484,12 @@ let curIdx         = -1;
 let freqCache      = [];
 
 let isPaused       = false;
-let muteDeadAir    = true;
+// Default OFF. With this ON, any squelch misconfiguration is indistinguishable
+// from a broken build: the stream is running fine but the browser replaces
+// every chunk with silence. Turn it on once squelch is tuned.
+let muteDeadAir    = false;
+let socketOk       = false;
+let lastErrShown   = null;
 
 // PCM Audio Player
 const player = (() => {
@@ -560,13 +565,24 @@ const player = (() => {
 })();
 
 // Socket.IO
-const socket = io({ transports: ['websocket', 'polling'] });
+// Do NOT pin transports to websocket-first. socket.io-client 4.7 has no
+// tryAllTransports fallback, so if the websocket handshake fails (server
+// without simple-websocket installed, or a proxy that does not forward
+// Upgrade headers) the client never connects at all and the page sits there
+// dead: no audio, no meter, no status. The default is polling then an
+// upgrade to websocket, which degrades instead of failing.
+const socket = io({ reconnectionDelayMax: 5000 });
 
 socket.on('connect',    () => {
+  socketOk = true;
   fetchStatus();
   if (audioOn) socket.emit('audio_subscribe');
 });
-socket.on('disconnect', () => setDot('idle', 'DISCONNECTED'));
+socket.on('disconnect', () => { socketOk = false; setDot('idle', 'DISCONNECTED'); });
+socket.on('connect_error', e => {
+  socketOk = false;
+  console.warn('socket.io connect_error:', e && e.message);
+});
 
 socket.on('scanner_update', data => updateScannerUI(data));
 
@@ -991,11 +1007,23 @@ async function fetchStatus() {
       total:   freqCache.length,
     });
     if (d.running) el('hdr-live').style.display = 'inline-block';
+
+    if (d.last_error && d.last_error !== lastErrShown) {
+      lastErrShown = d.last_error;
+      toast(String(d.last_error).toUpperCase());
+    } else if (!d.last_error) {
+      lastErrShown = null;
+    }
   } catch {}
 }
 
 // Boot
 checkToken();
+fetchStatus();
+
+// Polling fallback. If the socket never comes up the UI used to freeze on
+// IDLE forever, because fetchStatus only ran from the socket connect handler.
+setInterval(() => { if (!socketOk) fetchStatus(); }, 3000);
 </script>
 </body>
 </html>
