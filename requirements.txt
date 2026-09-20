@@ -1,4 +1,5 @@
-flask
-flask-socketio
-werkzeug
-numpy
+flask>=3.0,<4.0
+flask-socketio>=5.3,<6.0
+werkzeug>=3.0,<4.0
+numpy>=1.24
+simple-websocket>=1.0
