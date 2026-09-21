@@ -131,7 +131,7 @@ If device passthrough does not work, add `--privileged` instead of the `--device
 
 ## Configuration Reference
 
-All settings are saved to `/data/config.json` inside the container (persisted via the Docker volume). You can edit them from the Settings panel in the UI, or edit the JSON file directly and restart the container.
+All settings are saved to `/data/config.json` inside the container (persisted via the Docker volume). You can edit them from the Settings panel in the UI, or edit the JSON file directly and restart the container. Frequency entries are validated on load: a numeric string for `freq` is converted, an invalid mode falls back to `fm`, and entries that cannot be repaired are dropped with a warning in the container log. Check the log after hand-editing.
 
 | Setting | Default | Description |
 |---|---|---|
@@ -163,6 +163,7 @@ These are set in `docker-compose.yml` or passed with `-e` on `docker run`:
 | `CONFIG_FILE` | `/data/config.json` | Path to the config file inside the container |
 | `PORT` | `8073` | Port the server listens on inside the container |
 | `ALLOWED_ORIGINS` | *(unset)* | Socket.IO CORS allowlist. Unset = same-origin only. Set to `*` for unrestricted (not recommended) or a comma-separated origin list, e.g. `https://radio.example.com,https://intra.lan` |
+| `TRUST_PROXY`     | *(unset)*           | Set to `1` only behind a reverse proxy you control that sets `X-Forwarded-For`. Unset: the header is ignored and rate limiting uses the direct peer address. Enabled without a proxy: anyone can bypass the login rate limit by forging the header. Behind a proxy but unset: all clients share the proxy's address and one rate-limit bucket |
 
 ---
 
@@ -273,7 +274,7 @@ Reads are non-blocking (`select` with a 50ms timeout). A single empty timeout is
 - This application has no HTTPS out of the box. Put it behind a reverse proxy (nginx, Caddy, Traefik) with TLS if you expose it to the internet
 - The default password is `changeme` - you are forced to change it on first login (8-character minimum)
 - Passwords are stored as salted hashes via Werkzeug's `generate_password_hash`
-- Login attempts are rate-limited to 8 per IP per 5 minutes
+- Login attempts are rate-limited to 8 per IP per 5 minutes. See `TRUST_PROXY` for how the IP is determined
 - Changing the password invalidates all other active sessions
 - Session tokens are stored in `localStorage` on the client and expire after 24 hours. Tokens do not survive a container restart
 - Socket.IO CORS is locked to same-origin by default; widen it via `ALLOWED_ORIGINS` if you need to embed the UI cross-origin
