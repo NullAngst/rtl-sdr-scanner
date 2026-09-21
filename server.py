@@ -75,13 +75,51 @@ DEFAULTS = {
 _cfg_lock = threading.RLock()
 
 
+def _sanitize_freqs(raw) -> list:
+    """Drop or repair junk frequency entries.
+
+    The README tells people to edit config.json by hand, and nothing
+    validated what came back. A `"freq": "162400000"` (string, not int) used
+    to raise TypeError inside the scan thread, which killed the thread while
+    `running` stayed True: the UI showed SCANNING forever with no audio.
+    """
+    out = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        if not isinstance(item, dict):
+            log.warning(f'Dropping non-object frequency entry: {item!r}')
+            continue
+        try:
+            freq = int(item.get('freq'))
+        except (TypeError, ValueError):
+            log.warning(f'Dropping frequency entry with bad freq: {item!r}')
+            continue
+        if not (500_000 <= freq <= 1_750_000_000):
+            log.warning(f'Dropping out-of-range frequency: {freq}')
+            continue
+        mode = str(item.get('mode', 'fm')).lower().strip()
+        if mode not in VALID_MODES:
+            log.warning(f'Frequency {freq} had invalid mode {mode!r}, using fm')
+            mode = 'fm'
+        label = item.get('label')
+        label = str(label).strip()[:80] if label is not None else ''
+        if not label:
+            label = f'{freq / 1e6:.3f} MHz'
+        out.append({'freq': freq, 'label': label, 'mode': mode})
+    return out
+
+
 def load_config() -> dict:
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE) as f:
                 data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError('config root is not an object')
             for k, v in DEFAULTS.items():
                 data.setdefault(k, v)
+            data['frequencies'] = _sanitize_freqs(data.get('frequencies'))
             ph = data.get('admin_password_hash', '')
             if (isinstance(ph, str) and len(ph) == 64 and
                     all(c in '0123456789abcdef' for c in ph.lower())):
@@ -188,10 +226,18 @@ def login_rate_limit_ok(ip: str) -> bool:
         return True
 
 
+TRUST_PROXY = os.environ.get('TRUST_PROXY', '').strip().lower() in (
+    '1', 'true', 'yes', 'on')
+
+
 def client_ip() -> str:
-    xff = request.headers.get('X-Forwarded-For', '')
-    if xff:
-        return xff.split(',')[0].strip()
+    # X-Forwarded-For is client-controlled unless a proxy you trust is
+    # rewriting it. Honouring it unconditionally let anyone bypass the login
+    # rate limit by varying the header, so it is now opt-in.
+    if TRUST_PROXY:
+        xff = request.headers.get('X-Forwarded-For', '')
+        if xff:
+            return xff.split(',')[0].strip()
     return request.remote_addr or '0.0.0.0'
 
 
@@ -388,6 +434,23 @@ class Scanner:
         return self.running and self._gen == gen
 
     def _loop(self, gen: int):
+        # Belt and braces: anything unhandled in here used to kill the thread
+        # outright while `running` stayed True, so the UI reported SCANNING
+        # forever with dead silence and no way to recover but a restart.
+        try:
+            self._scan(gen)
+        except Exception as e:
+            log.exception('Scanner thread crashed')
+            self.last_error = f'Scanner crashed: {e}'
+        finally:
+            with self._life_lock:
+                if self._gen == gen:
+                    self.running = False
+                    self.current_freq = None
+                    socketio.emit('scanner_update', {'running': False})
+            log.info('Scanner loop exited')
+
+    def _scan(self, gen: int):
         consecutive_failures = 0
         last_sig_emit = 0.0
         while self._alive(gen):
@@ -602,16 +665,6 @@ class Scanner:
             # else: rtl_fm was alive but hardware-squelched the whole dwell.
             # A quiet channel is not a failure; don't count it, or scanning a
             # list of idle channels in RF mode kills the scanner after five.
-
-        # Only the current generation owns the shared state. A superseded
-        # thread must not flip `running` off under a scanner that has already
-        # been restarted.
-        with self._life_lock:
-            if self._gen == gen:
-                self.running = False
-                self.current_freq = None
-                socketio.emit('scanner_update', {'running': False})
-        log.info('Scanner loop exited')
 
     def start(self) -> tuple[bool, str | None]:
         with self._life_lock:
