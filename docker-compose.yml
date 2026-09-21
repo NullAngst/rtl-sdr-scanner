@@ -25,6 +25,9 @@ services:
       # Set to "*" for unrestricted (not recommended) or a comma-separated
       # list of origins, e.g. "https://radio.example.com,https://intra.lan".
       # - ALLOWED_ORIGINS=
+      # Optional: set to 1 ONLY behind a reverse proxy you control that sets
+      # X-Forwarded-For. Unset = header ignored (safe default).
+      # - TRUST_PROXY=1
 
     # ── Persistent Storage ────────────────────────────────────────────────────
     volumes:
