@@ -2,7 +2,7 @@
 #  RTL-SDR Scanner — Docker Compose Stack
 #
 #  Deploy this file as a Stack in Portainer.
-#  REQUIRED: Change SECRET_KEY before first run.
+#  First run: the one-time admin password is printed in the container log.
 #  REQUIRED: Your RTL-SDR dongle must be plugged in before the container starts.
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -19,14 +19,16 @@ services:
     environment:
       - PORT=8073
       - CONFIG_FILE=/data/config.json
-      # CHANGE THIS — use `openssl rand -hex 32` to generate a secure value
+      # Not used by the app today (no Flask sessions). Set one anyway if you
+      # like: `openssl rand -hex 32`
       - SECRET_KEY=${SECRET_KEY:-change_this_to_a_random_secret_key_before_running}
       # Optional: restrict Socket.IO CORS. Empty/unset = same-origin only.
       # Set to "*" for unrestricted (not recommended) or a comma-separated
       # list of origins, e.g. "https://radio.example.com,https://intra.lan".
       # - ALLOWED_ORIGINS=
-      # Optional: set to 1 ONLY behind a reverse proxy you control that sets
-      # X-Forwarded-For. Unset = header ignored (safe default).
+      # Optional: set to 1 ONLY behind a reverse proxy you control that appends
+      # to X-Forwarded-For (NPM/NPMPlus do). Use 2 if there are two proxies
+      # (e.g. Cloudflare in front of NPM). Unset = header ignored.
       # - TRUST_PROXY=1
 
     # ── Persistent Storage ────────────────────────────────────────────────────

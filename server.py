@@ -36,6 +36,10 @@ VALID_MODES = {'fm', 'am', 'usb', 'lsb', 'raw', 'wbfm'}
 # App Setup
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', secrets.token_hex(32))
+# Every API body is a few hundred bytes of JSON. Without a cap, an
+# unauthenticated POST to /api/login with a multi-GB body was read fully into
+# memory before the rate limiter or the JSON parser ever looked at it.
+app.config['MAX_CONTENT_LENGTH'] = 64 * 1024
 
 _origins_env = os.environ.get('ALLOWED_ORIGINS', '').strip()
 if _origins_env == '*':
@@ -43,8 +47,12 @@ if _origins_env == '*':
 elif _origins_env:
     _cors_origins = [o.strip() for o in _origins_env.split(',') if o.strip()]
 else:
-    _cors_origins = []
-    
+    # None, NOT []. python-engineio treats [] as "CORS handling disabled",
+    # which skips the Origin check entirely, so any website could open a
+    # WebSocket to this server from a visitor's browser. None is the
+    # library's same-origin default.
+    _cors_origins = None
+
 socketio = SocketIO(
     app,
     cors_allowed_origins=_cors_origins,
@@ -59,8 +67,12 @@ CONFIG_FILE = os.environ.get('CONFIG_FILE', '/data/config.json')
 
 DEFAULTS = {
     'admin_username': 'admin',
-    'admin_password_hash': generate_password_hash('changeme'),
+    # Filled in by _ensure_admin_password() with a random one-time password.
+    # A fixed published default meant whoever reached a fresh instance
+    # first owned it.
+    'admin_password_hash': '',
     'must_change_password': True,
+    'initial_password_pending': False,
     'frequencies': [],
     'squelch_mode': 'audio',
     'squelch_db': -35.0,
@@ -110,7 +122,95 @@ def _sanitize_freqs(raw) -> list:
     return out
 
 
+# Settings validation (shared by the API and the config loader)
+SETTINGS_KEYS = (
+    'squelch_mode', 'squelch_db', 'rf_squelch', 'diff_squelch',
+    'dwell_time', 'sample_rate', 'ppm', 'gain'
+)
+
+
+def _coerce_settings(d: dict) -> tuple[dict, str | None]:
+    out: dict = {}
+    if 'squelch_mode' in d:
+        v = str(d['squelch_mode']).lower()
+        if v in ('audio', 'rf', 'diff'):
+            out['squelch_mode'] = v
+        else:
+            return {}, 'Invalid squelch mode'
+    if 'squelch_db' in d:
+        try:
+            v = float(d['squelch_db'])
+            if not -120 <= v <= 0: return {}, 'squelch_db must be between -120 and 0'
+            out['squelch_db'] = v
+        except (ValueError, TypeError): return {}, 'squelch_db must be a number'
+    if 'rf_squelch' in d:
+        try:
+            v = int(d['rf_squelch'])
+            if not 0 <= v <= 1000: return {}, 'rf_squelch must be between 0 and 1000'
+            out['rf_squelch'] = v
+        except (ValueError, TypeError): return {}, 'rf_squelch must be an integer'
+    if 'diff_squelch' in d:
+        try:
+            v = float(d['diff_squelch'])
+            if not 0.1 <= v <= 50.0: return {}, 'diff_squelch must be between 0.1 and 50'
+            out['diff_squelch'] = v
+        except (ValueError, TypeError): return {}, 'diff_squelch must be a number'
+    if 'dwell_time' in d:
+        try:
+            v = float(d['dwell_time'])
+            if not 0.1 <= v <= 600: return {}, 'dwell_time must be between 0.1 and 600'
+            out['dwell_time'] = v
+        except (ValueError, TypeError): return {}, 'dwell_time must be a number'
+    if 'sample_rate' in d:
+        try:
+            v = int(d['sample_rate'])
+            if v not in (8000, 16000, 22050, 24000, 32000, 44100, 48000): return {}, 'Invalid sample_rate'
+            out['sample_rate'] = v
+        except (ValueError, TypeError): return {}, 'sample_rate must be an integer'
+    if 'ppm' in d:
+        try:
+            v = int(d['ppm'])
+            if not -200 <= v <= 200: return {}, 'ppm must be between -200 and 200'
+            out['ppm'] = v
+        except (ValueError, TypeError): return {}, 'ppm must be an integer'
+    if 'gain' in d:
+        g = str(d['gain']).strip().lower()
+        if g == 'auto':
+            out['gain'] = 'auto'
+        else:
+            try:
+                gv = float(g)
+                if not 0 <= gv <= 100: return {}, 'gain must be between 0 and 100 dB'
+                out['gain'] = g
+            except ValueError: return {}, 'gain must be "auto" or a number'
+    return out, None
+
+
+
+def _sanitize_settings(data: dict):
+    """Validate hand-edited settings the same way the API does.
+
+    A bad value used to reach the scan thread unchecked: "sample_rate": 0
+    made chunk_bytes 0 and spun the read loop forever, and a string
+    sample_rate turned `sr * 100` into string repetition and crashed it.
+    """
+    for k in SETTINGS_KEYS:
+        if k not in data:
+            continue
+        clean, err = _coerce_settings({k: data[k]})
+        if err:
+            log.warning(f'Config value {k}={data[k]!r} rejected ({err}), '
+                        f'using default {DEFAULTS[k]!r}')
+            data[k] = DEFAULTS[k]
+        else:
+            data[k] = clean[k]
+
+
+_config_load_failed = False
+
+
 def load_config() -> dict:
+    global _config_load_failed
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE) as f:
@@ -120,14 +220,10 @@ def load_config() -> dict:
             for k, v in DEFAULTS.items():
                 data.setdefault(k, v)
             data['frequencies'] = _sanitize_freqs(data.get('frequencies'))
-            ph = data.get('admin_password_hash', '')
-            if (isinstance(ph, str) and len(ph) == 64 and
-                    all(c in '0123456789abcdef' for c in ph.lower())):
-                data['admin_password_hash'] = generate_password_hash(
-                    secrets.token_hex(32))
-                data['must_change_password'] = True
+            _sanitize_settings(data)
             return data
         except Exception as e:
+            _config_load_failed = True
             log.error(f'Failed to load config: {e}')
     return dict(DEFAULTS)
 
@@ -156,6 +252,68 @@ def save_config():
 
 
 cfg = load_config()
+
+
+def _is_legacy_hash(ph) -> bool:
+    # Pre-Werkzeug installs stored a bare unsalted SHA-256 hex digest.
+    return (isinstance(ph, str) and len(ph) == 64 and
+            all(c in '0123456789abcdef' for c in ph.lower()))
+
+
+def _ensure_admin_password():
+    """Replace a missing, legacy or publicly known admin password.
+
+    Fresh installs used to boot with admin / changeme and nothing on the
+    server enforced the change: must_change_password was only honoured by
+    the browser UI. Anyone who reached a new instance first could log in,
+    change the password and lock the owner out.
+
+    Legacy SHA-256 hashes used to be swapped for the hash of a random value
+    that was never shown anywhere, which locked the owner out for good.
+
+    Now any of those cases gets a random one-time password, written to the
+    container log. It is regenerated on every start until the admin sets
+    their own, so a restart before first login does not strand anyone.
+    """
+    with _cfg_lock:
+        ph = cfg.get('admin_password_hash')
+        reason = None
+        if not isinstance(ph, str) or not ph:
+            reason = 'no admin password set'
+        elif _is_legacy_hash(ph):
+            reason = 'legacy unsalted password hash'
+        elif cfg.get('initial_password_pending'):
+            reason = 'initial password not changed yet'
+        else:
+            try:
+                if check_password_hash(ph, 'changeme'):
+                    reason = 'admin password is the old public default'
+            except Exception:
+                reason = 'admin password hash is unreadable'
+        if reason is None:
+            return
+
+        pw = secrets.token_urlsafe(12)
+        cfg['admin_password_hash'] = generate_password_hash(pw)
+        cfg['must_change_password'] = True
+        cfg['initial_password_pending'] = True
+        if not _config_load_failed:
+            # Do not overwrite a config file that failed to parse; the
+            # password then lives in memory only and changes per restart.
+            save_config()
+        user = cfg.get('admin_username', 'admin')
+
+    bar = '=' * 64
+    log.warning(bar)
+    log.warning(f'One-time admin login ({reason}):')
+    log.warning(f'    username: {user}')
+    log.warning(f'    password: {pw}')
+    log.warning('Log in and set your own password. This one is regenerated')
+    log.warning('on every restart until you do.')
+    log.warning(bar)
+
+
+_ensure_admin_password()
 
 # Session Auth
 _sessions: dict[str, float] = {}
@@ -220,25 +378,53 @@ def login_rate_limit_ok(ip: str) -> bool:
             return False
         q.append(now)
         if len(_login_attempts) > 1024:
+            # A deque is only trimmed when its own IP comes back, so most
+            # never empty out. Dropping only empty ones deleted nothing and
+            # let the table grow without bound.
             for k in list(_login_attempts.keys()):
-                if not _login_attempts[k]:
+                dq = _login_attempts[k]
+                if not dq or dq[-1] < cutoff:
                     del _login_attempts[k]
         return True
 
 
-TRUST_PROXY = os.environ.get('TRUST_PROXY', '').strip().lower() in (
-    '1', 'true', 'yes', 'on')
+def _parse_trust_proxy(raw: str) -> int:
+    v = raw.strip().lower()
+    if v in ('true', 'yes', 'on'):
+        return 1
+    try:
+        return max(0, min(int(v), 10))
+    except ValueError:
+        return 0
+
+
+# Number of reverse proxies in front of the app that append to
+# X-Forwarded-For. 0 (unset) ignores the header.
+TRUST_PROXY_HOPS = _parse_trust_proxy(os.environ.get('TRUST_PROXY', ''))
 
 
 def client_ip() -> str:
     # X-Forwarded-For is client-controlled unless a proxy you trust is
-    # rewriting it. Honouring it unconditionally let anyone bypass the login
-    # rate limit by varying the header, so it is now opt-in.
-    if TRUST_PROXY:
+    # rewriting it, so it is opt-in.
+    #
+    # Read it from the RIGHT. nginx (and NPM/NPMPlus) append the real peer
+    # address to whatever the client sent, so with one proxy the last entry
+    # is the only one the client cannot forge. The first entry is whatever
+    # the attacker typed, and taking it let anyone rotate it per request to
+    # dodge the login rate limit.
+    if TRUST_PROXY_HOPS:
         xff = request.headers.get('X-Forwarded-For', '')
-        if xff:
-            return xff.split(',')[0].strip()
+        parts = [p.strip() for p in xff.split(',') if p.strip()]
+        if len(parts) >= TRUST_PROXY_HOPS:
+            return parts[-TRUST_PROXY_HOPS]
     return request.remote_addr or '0.0.0.0'
+
+
+def _json_body() -> dict:
+    # get_json() happily returns a list or a string for a JSON body like
+    # [1] or "x", and every handler then died on d.get() with a 500.
+    d = request.get_json(force=True, silent=True)
+    return d if isinstance(d, dict) else {}
 
 
 # Connected Client Tracking
@@ -320,6 +506,10 @@ class Scanner:
         # matches is a leftover and must exit without touching shared state.
         self._gen = 0
         self._life_lock = threading.Lock()
+        # Set when the frequency list changed under the current channel in a
+        # way that means "tune again now" (current entry deleted, list
+        # emptied). The scan loop breaks out without advancing.
+        self._retune = False
 
     def _kill_proc(self):
         with self._proc_lock:
@@ -433,6 +623,15 @@ class Scanner:
     def _alive(self, gen: int) -> bool:
         return self.running and self._gen == gen
 
+    def _advance(self):
+        # Step from current_idx against the LIVE list. The loop used to step
+        # from its own stale idx/len snapshot, which threw away the index
+        # correction notify_freqs_changed() had just made: delete an entry
+        # above the current one and the next channel got skipped.
+        with _cfg_lock:
+            n = len(cfg.get('frequencies', []))
+        self.current_idx = (self.current_idx + 1) % n if n else 0
+
     def _loop(self, gen: int):
         # Belt and braces: anything unhandled in here used to kill the thread
         # outright while `running` stayed True, so the UI reported SCANNING
@@ -457,6 +656,8 @@ class Scanner:
             with _cfg_lock:
                 freqs = list(cfg.get('frequencies', []))
                 sr = cfg.get('sample_rate', 16000)
+                # This snapshot already reflects any earlier list change.
+                self._retune = False
 
             if not freqs:
                 for _ in range(5):
@@ -481,7 +682,7 @@ class Scanner:
 
             mode = fi.get('mode', 'fm')
             if mode not in VALID_MODES:
-                self.current_idx = (idx + 1) % len(freqs)
+                self._advance()
                 time.sleep(0.2)
                 continue
 
@@ -507,9 +708,12 @@ class Scanner:
             db_history = []  # Used for rolling variance calculation in diff mode
 
             while self._alive(gen):
+                if self._retune:
+                    self._retune = False
+                    break
                 if self.force_skip:
                     self.force_skip = False
-                    self.current_idx = (idx + 1) % len(freqs)
+                    self._advance()
                     break
 
                 with _cfg_lock:
@@ -630,7 +834,7 @@ class Scanner:
 
                 if silence_start is not None and not self.paused and (time.time() - silence_start) >= dwell:
                     log.info(f'Silence for {dwell}s on {fi["freq"]/1e6:.3f} MHz, advancing')
-                    self.current_idx = (idx + 1) % len(freqs)
+                    self._advance()
                     break
 
             # Did rtl_fm die on its own, or are we killing it to retune?
@@ -690,9 +894,15 @@ class Scanner:
             return False, 'rtl_fm not found in the container'
 
         with self._life_lock:
+            # A second start() that raced this one through the join above
+            # would otherwise launch a second thread and a second rtl_fm on
+            # the same dongle.
+            if self.running and self._thread and self._thread.is_alive():
+                return True, None
             self._gen += 1
             gen = self._gen
             self.running = True
+            self._retune = False
             self.paused = False
             self.force_skip = False
             self.last_error = None
@@ -718,16 +928,27 @@ class Scanner:
 
     def notify_freqs_changed(self):
         with _cfg_lock:
-            freqs = cfg.get('frequencies', [])
+            freqs = list(cfg.get('frequencies', []))
         if not freqs:
             self.current_idx = 0
+            self._retune = True
             return
         cur = self.current_freq
         if cur is not None:
+            # Identity first: entries are never copied while running, so this
+            # finds the right one even when two entries look identical.
             for i, f in enumerate(freqs):
-                if f is cur or (f.get('freq') == cur.get('freq') and f.get('mode') == cur.get('mode') and f.get('label') == cur.get('label')):
+                if f is cur:
                     self.current_idx = i
                     return
+            for i, f in enumerate(freqs):
+                if (f.get('freq') == cur.get('freq') and f.get('mode') == cur.get('mode')
+                        and f.get('label') == cur.get('label')):
+                    self.current_idx = i
+                    return
+            # The channel being listened to was deleted. Stop listening to it
+            # and tune whatever slid into its slot.
+            self._retune = True
         if self.current_idx >= len(freqs):
             self.current_idx = 0
 
@@ -736,6 +957,17 @@ scanner = Scanner()
 
 
 # API Routes
+
+@app.after_request
+def _frame_headers(resp):
+    # The admin UI is a page of one-click buttons (STOP, DEL) driven by a
+    # token in localStorage. Refuse framing so another site cannot overlay
+    # it and steer a logged-in admin's clicks. If you deliberately iframe
+    # this into a dashboard, remove these two lines.
+    resp.headers.setdefault('X-Frame-Options', 'DENY')
+    resp.headers.setdefault('Content-Security-Policy', "frame-ancestors 'none'")
+    return resp
+
 
 @app.route('/')
 def index():
@@ -748,7 +980,7 @@ def login():
     if not login_rate_limit_ok(ip):
         return jsonify(error='Too many attempts, try again in a few minutes'), 429
 
-    d = request.get_json(force=True, silent=True) or {}
+    d = _json_body()
     username = d.get('username', '') or ''
     password = d.get('password', '') or ''
     if not isinstance(username, str) or not isinstance(password, str):
@@ -821,7 +1053,7 @@ def get_freqs():
 @app.route('/api/frequencies', methods=['POST'])
 @admin_required
 def add_freq():
-    d = request.get_json(force=True, silent=True) or {}
+    d = _json_body()
     raw_freq = d.get('freq')
     if raw_freq is None or isinstance(raw_freq, bool):
         return jsonify(error='freq is required'), 400
@@ -857,13 +1089,17 @@ def add_freq():
 @app.route('/api/frequencies/<int:idx>', methods=['PUT'])
 @admin_required
 def update_freq(idx):
-    d = request.get_json(force=True, silent=True) or {}
+    d = _json_body()
     with _cfg_lock:
         freqs = cfg.get('frequencies', [])
         if not (0 <= idx < len(freqs)):
             return jsonify(error='Not found'), 404
         if 'label' in d:
-            freqs[idx]['label'] = str(d['label']).strip()[:80]
+            label = d['label']
+            label = str(label).strip()[:80] if label is not None else ''
+            if not label:
+                label = f'{freqs[idx]["freq"] / 1e6:.3f} MHz'
+            freqs[idx]['label'] = label
         if 'mode' in d:
             mode = str(d['mode']).lower().strip()
             if mode not in VALID_MODES:
@@ -937,70 +1173,6 @@ def skip_scanner():
     return jsonify(ok=True)
 
 
-# Settings
-SETTINGS_KEYS = (
-    'squelch_mode', 'squelch_db', 'rf_squelch', 'diff_squelch',
-    'dwell_time', 'sample_rate', 'ppm', 'gain'
-)
-
-
-def _coerce_settings(d: dict) -> tuple[dict, str | None]:
-    out: dict = {}
-    if 'squelch_mode' in d:
-        v = str(d['squelch_mode']).lower()
-        if v in ('audio', 'rf', 'diff'):
-            out['squelch_mode'] = v
-        else:
-            return {}, 'Invalid squelch mode'
-    if 'squelch_db' in d:
-        try:
-            v = float(d['squelch_db'])
-            if not -120 <= v <= 0: return {}, 'squelch_db must be between -120 and 0'
-            out['squelch_db'] = v
-        except (ValueError, TypeError): return {}, 'squelch_db must be a number'
-    if 'rf_squelch' in d:
-        try:
-            v = int(d['rf_squelch'])
-            if not 0 <= v <= 1000: return {}, 'rf_squelch must be between 0 and 1000'
-            out['rf_squelch'] = v
-        except (ValueError, TypeError): return {}, 'rf_squelch must be an integer'
-    if 'diff_squelch' in d:
-        try:
-            v = float(d['diff_squelch'])
-            if not 0.1 <= v <= 50.0: return {}, 'diff_squelch must be between 0.1 and 50'
-            out['diff_squelch'] = v
-        except (ValueError, TypeError): return {}, 'diff_squelch must be a number'
-    if 'dwell_time' in d:
-        try:
-            v = float(d['dwell_time'])
-            if not 0.1 <= v <= 600: return {}, 'dwell_time must be between 0.1 and 600'
-            out['dwell_time'] = v
-        except (ValueError, TypeError): return {}, 'dwell_time must be a number'
-    if 'sample_rate' in d:
-        try:
-            v = int(d['sample_rate'])
-            if v not in (8000, 16000, 22050, 24000, 32000, 44100, 48000): return {}, 'Invalid sample_rate'
-            out['sample_rate'] = v
-        except (ValueError, TypeError): return {}, 'sample_rate must be an integer'
-    if 'ppm' in d:
-        try:
-            v = int(d['ppm'])
-            if not -200 <= v <= 200: return {}, 'ppm must be between -200 and 200'
-            out['ppm'] = v
-        except (ValueError, TypeError): return {}, 'ppm must be an integer'
-    if 'gain' in d:
-        g = str(d['gain']).strip().lower()
-        if g == 'auto':
-            out['gain'] = 'auto'
-        else:
-            try:
-                gv = float(g)
-                if not 0 <= gv <= 100: return {}, 'gain must be between 0 and 100 dB'
-                out['gain'] = g
-            except ValueError: return {}, 'gain must be "auto" or a number'
-    return out, None
-
-
 @app.route('/api/settings', methods=['GET'])
 @admin_required
 def get_settings():
@@ -1011,7 +1183,7 @@ def get_settings():
 @app.route('/api/settings', methods=['POST'])
 @admin_required
 def update_settings():
-    d = request.get_json(force=True, silent=True) or {}
+    d = _json_body()
     clean, err = _coerce_settings(d)
     if err:
         return jsonify(error=err), 400
@@ -1041,7 +1213,7 @@ def update_settings():
 @app.route('/api/change_password', methods=['POST'])
 @admin_required
 def change_password():
-    d = request.get_json(force=True, silent=True) or {}
+    d = _json_body()
     pw = d.get('password', '')
     if not isinstance(pw, str) or len(pw) < 8:
         return jsonify(error='Password must be at least 8 characters'), 400
@@ -1050,6 +1222,7 @@ def change_password():
     with _cfg_lock:
         cfg['admin_password_hash'] = new_hash
         cfg['must_change_password'] = False
+        cfg['initial_password_pending'] = False
         save_config()
 
     cur_token = request.headers.get('X-Token', '')
@@ -1067,8 +1240,9 @@ if __name__ == '__main__':
     if not shutil.which('rtl_fm'):
         log.error('rtl_fm not found on PATH - the scanner will not produce audio. '
                   'Install the rtl-sdr package (or rebuild the image).')
-    if cfg.get('must_change_password'):
-        log.warning('Default credentials in use: admin / changeme - CHANGE PASSWORD ON FIRST LOGIN')
+    if cfg.get('initial_password_pending'):
+        log.warning('Admin is still on the one-time password logged above - '
+                    'log in and change it')
     socketio.run(
         app,
         host='0.0.0.0',

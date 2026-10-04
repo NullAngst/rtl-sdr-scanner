@@ -5,7 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>RTL-SDR Scanner</title>
 <link href="https://fonts.googleapis.com/css2?family=VT323&family=Share+Tech+Mono&display=swap" rel="stylesheet">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
+<!-- socket.io-client 4.8.4, vendored from the npm tarball (sha512 verified). -->
+<script src="{{ url_for('static', filename='socket.io.min.js') }}"></script>
 <style>
 /* Variables */
 :root {

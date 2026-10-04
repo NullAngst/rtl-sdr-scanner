@@ -1,5 +1,6 @@
 # ── Build Stage ───────────────────────────────────────────────────────────────
-FROM python:3.11-slim AS base
+# numpy 2.5 needs Python >= 3.12.
+FROM python:3.14-slim AS base
 
 LABEL maintainer="RTL-SDR Scanner"
 LABEL description="Self-hosted RTL-SDR multi-frequency scanner with web UI"
@@ -17,10 +18,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt
 
 COPY server.py .
 COPY templates/ templates/
+COPY static/ static/
 
 # Persistent config lives here — mount a volume to this path
 RUN mkdir -p /data

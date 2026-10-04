@@ -83,14 +83,15 @@ Portainer will pull the local image from your Docker cache and start the contain
 
 Open `http://your-host-ip:8073` in any browser.
 
-Default admin credentials:
+There is no fixed default password. On first start the container generates a one-time admin password and prints it to its log. In Portainer that's the container's **Logs** tab; from a shell:
 
-```text
-Username: admin
-Password: changeme
+```bash
+docker logs rtl-sdr-scanner 2>&1 | grep -A3 "One-time admin login"
 ```
 
-On first login the UI will require you to set a new password (minimum 8 characters) before continuing. Existing installs with the legacy unsalted SHA-256 hash are automatically forced into the same flow on next startup.
+Log in as `admin` with that password. The UI then makes you set your own (minimum 8 characters). Until you do, a new one-time password is generated and logged on every restart.
+
+Upgrading an older install: if the stored password is still `changeme`, or is a legacy unsalted SHA-256 hash, it gets replaced with a one-time password the same way on next startup. Check the log after upgrading.
 
 ---
 
@@ -120,7 +121,7 @@ If device passthrough does not work, add `--privileged` instead of the `--device
 
 ## First-Use Walkthrough
 
-1. **Log in** - click LOGIN in the top-right corner and enter the admin credentials
+1. **Log in** - click LOGIN in the top-right corner and use `admin` plus the one-time password from the container log
 2. **Change your password** - expand the Settings panel and set a new password
 3. **Add frequencies** - click `+ ADD` above the frequency list. Enter the frequency in Hz (e.g. `162400000` for 162.400 MHz NOAA Weather), a label, and a mode
 4. **Start the scanner** - click START SCAN. The display will show the current frequency and cycle automatically
@@ -159,11 +160,11 @@ These are set in `docker-compose.yml` or passed with `-e` on `docker run`:
 
 | Variable | Default | Description |
 |---|---|---|
-| `SECRET_KEY` | random | Signs Flask session tokens. Set a fixed value if you start using Flask sessions; currently the app uses an in-memory session table that does not survive restarts |
+| `SECRET_KEY` | random | Not used by anything today. The app keeps its own in-memory session table and never signs a Flask session. Only matters if Flask sessions get added later |
 | `CONFIG_FILE` | `/data/config.json` | Path to the config file inside the container |
 | `PORT` | `8073` | Port the server listens on inside the container |
 | `ALLOWED_ORIGINS` | *(unset)* | Socket.IO CORS allowlist. Unset = same-origin only. Set to `*` for unrestricted (not recommended) or a comma-separated origin list, e.g. `https://radio.example.com,https://intra.lan` |
-| `TRUST_PROXY`     | *(unset)*           | Set to `1` only behind a reverse proxy you control that sets `X-Forwarded-For`. Unset: the header is ignored and rate limiting uses the direct peer address. Enabled without a proxy: anyone can bypass the login rate limit by forging the header. Behind a proxy but unset: all clients share the proxy's address and one rate-limit bucket |
+| `TRUST_PROXY`     | *(unset)*           | Number of reverse proxies in front of the app that append to `X-Forwarded-For` (`1` for NPM/nginx/Caddy alone, `2` with Cloudflare in front of that). The client address is read that many entries from the right, since entries further left are whatever the client sent. Unset: the header is ignored and rate limiting uses the direct peer address. Enabled without a proxy: anyone can bypass the login rate limit by forging the header. Behind a proxy but unset: all clients share the proxy's address and one rate-limit bucket |
 
 ---
 
@@ -272,12 +273,15 @@ Reads are non-blocking (`select` with a 50ms timeout). A single empty timeout is
 ## Security Notes
 
 - This application has no HTTPS out of the box. Put it behind a reverse proxy (nginx, Caddy, Traefik) with TLS if you expose it to the internet
-- The default password is `changeme` - you are forced to change it on first login (8-character minimum)
+- There is no shared default password. A random one-time password is written to the container log and must be replaced on first login (8-character minimum). Anyone who can read the container log can read it, so change it right away
 - Passwords are stored as salted hashes via Werkzeug's `generate_password_hash`
 - Login attempts are rate-limited to 8 per IP per 5 minutes. See `TRUST_PROXY` for how the IP is determined
 - Changing the password invalidates all other active sessions
 - Session tokens are stored in `localStorage` on the client and expire after 24 hours. Tokens do not survive a container restart
-- Socket.IO CORS is locked to same-origin by default; widen it via `ALLOWED_ORIGINS` if you need to embed the UI cross-origin
+- Socket.IO only accepts connections whose `Origin` matches the host the page was served from (including `X-Forwarded-Proto`/`X-Forwarded-Host` from a proxy). If your proxy rewrites `Host`, list your public origin in `ALLOWED_ORIGINS`
+- The page refuses to be framed (`X-Frame-Options: DENY`). If you embed it in a dashboard iframe, remove the `_frame_headers` hook in `server.py`
+- Request bodies are capped at 64 KB
+- The Socket.IO browser client is served from `static/`, not a CDN
 - There is one admin account. Multiple admin accounts are not supported
 
 ---
