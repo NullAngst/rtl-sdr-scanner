@@ -1,0 +1,117 @@
+name: build
+
+# Pushes to main and pull requests only run checks.
+# Releases: draft a release with a new tag on the Releases page, publish it,
+# then run this workflow by hand from that tag ("Use workflow from").
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            printf 'Not gofmt-formatted:\n%s\n' "$unformatted" >&2
+            exit 1
+          fi
+
+      - name: vet
+        run: go vet ./...
+
+      - name: test
+        run: go test -race ./...
+
+      - name: JavaScript syntax
+        run: node --check web/app.js
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Docker build (amd64, not pushed)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          platforms: linux/amd64
+
+  release:
+    if: github.event_name == 'workflow_dispatch'
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Make sure this run is for a tag with a release
+        run: |
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+            printf 'This was run on branch "%s". Pick the release tag under "Use workflow from" instead.\n' "$GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          if ! gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            printf 'No release exists for tag %s. Create and publish it on the Releases page first.\n' "$GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+
+      - name: Static binaries
+        run: |
+          mkdir -p dist
+          build() {
+            out="dist/rtl-sdr-scanner-linux-$1"
+            CGO_ENABLED=0 GOOS=linux GOARCH="$2" GOARM="$3" \
+              go build -trimpath -ldflags="-s -w -X main.version=$GITHUB_REF_NAME" -o "$out" .
+          }
+          build amd64 amd64 ""
+          build arm64 arm64 ""
+          build armv7 arm 7
+          (cd dist && sha256sum rtl-sdr-scanner-linux-* > SHA256SUMS)
+
+      - name: Attach binaries to the release
+        run: gh release upload "$GITHUB_REF_NAME" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+
+      - name: Image name
+        id: img
+        run: printf 'name=ghcr.io/%s\n' "${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          build-args: VERSION=${{ github.ref_name }}
+          tags: |
+            ${{ steps.img.outputs.name }}:latest
+            ${{ steps.img.outputs.name }}:${{ github.ref_name }}
