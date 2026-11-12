@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="en" data-theme="crt">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RTL-SDR Scanner</title>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+
+<header>
+  <div class="logo">RTL<span class="sep">-</span>SDR <span class="hi">SCANNER</span></div>
+  <div class="hdr-right">
+    <span id="badge-live" class="badge live hidden">LIVE</span>
+    <span id="badge-admin" class="badge admin hidden">ADMIN</span>
+    <label class="theme-pick">
+      <span class="sr-only">Theme</span>
+      <select id="theme" class="input">
+        <option value="crt">CRT</option>
+        <option value="light">Light</option>
+        <option value="dark">Dark</option>
+        <option value="verdigris">Verdigris</option>
+        <option value="kawaii-light">Kawaii Light</option>
+        <option value="kawaii-dark">Kawaii Dark</option>
+      </select>
+    </label>
+    <button id="btn-login" class="btn" type="button">Log in</button>
+    <button id="btn-logout" class="btn danger hidden" type="button">Log out</button>
+  </div>
+</header>
+
+<div id="conn-banner" class="banner hidden">Lost the connection to the server. Reconnecting...</div>
+
+<main>
+  <div class="col">
+
+    <section class="panel" id="now">
+      <div class="status-row">
+        <span class="dot" id="dot"></span>
+        <span id="state-label">IDLE</span>
+        <span id="progress" class="dim"></span>
+        <div class="ctrls admin-only hidden">
+          <button id="btn-scan" class="btn primary" type="button">Start scan</button>
+          <button id="btn-hold" class="btn amber" type="button" disabled>Hold</button>
+          <button id="btn-skip" class="btn" type="button" disabled>Skip</button>
+        </div>
+      </div>
+
+      <div class="freq-wrap">
+        <span id="freq-big">---.----</span><span class="freq-unit">MHz</span>
+      </div>
+      <div id="freq-name">NOT SCANNING</div>
+      <div class="tags">
+        <span id="mode-tag" class="tag">MODE --</span>
+        <span id="sql-tag" class="tag">SQL --</span>
+        <span id="hold-tag" class="tag amber hidden">HELD</span>
+      </div>
+
+      <div class="meter">
+        <div class="meter-lbl"><span>SIGNAL</span><span id="meter-val">-- dBFS</span></div>
+        <div class="segs" id="segs"><div id="thresh" class="thresh hidden"></div></div>
+        <div class="ticks"><span>-100</span><span>-80</span><span>-60</span><span>-40</span><span>-20</span><span>0 dBFS</span></div>
+      </div>
+
+      <div id="error" class="error hidden"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-hdr">
+        <span>Channels <span id="ch-count" class="dim"></span></span>
+        <button id="btn-add" class="btn sm admin-only hidden" type="button">+ Add</button>
+      </div>
+
+      <form id="ch-form" class="ch-form hidden" autocomplete="off">
+        <div class="field">
+          <label for="ch-freq">Frequency (MHz)</label>
+          <input id="ch-freq" class="input" inputmode="decimal" placeholder="162.400" required>
+        </div>
+        <div class="field grow">
+          <label for="ch-label">Label</label>
+          <input id="ch-label" class="input" maxlength="80" placeholder="NOAA Weather">
+        </div>
+        <div class="field">
+          <label for="ch-mode">Mode</label>
+          <select id="ch-mode" class="input">
+            <option value="fm">FM</option>
+            <option value="am">AM</option>
+            <option value="usb">USB</option>
+            <option value="lsb">LSB</option>
+            <option value="wbfm">WBFM</option>
+          </select>
+        </div>
+        <label class="check"><input id="ch-lockout" type="checkbox"> Lockout</label>
+        <div class="form-btns">
+          <button class="btn primary" type="submit" id="ch-save">Add</button>
+          <button class="btn" type="button" id="ch-cancel">Cancel</button>
+        </div>
+        <p class="help full">FM for narrowband voice (public safety, weather, marine, FRS/GMRS). AM for airband. WBFM for broadcast radio. A locked-out channel stays in the list but the scan skips it.</p>
+      </form>
+
+      <ul id="ch-list" class="ch-list"></ul>
+    </section>
+  </div>
+
+  <div class="col">
+    <section class="panel">
+      <div class="panel-hdr"><span>Listen</span></div>
+      <button id="btn-play" class="btn big amber" type="button">Listen</button>
+      <div class="vol-row">
+        <label for="vol" class="dim">VOL</label>
+        <input type="range" id="vol" min="0" max="1" step="0.05" value="0.8">
+        <span id="vol-pct" class="dim">80%</span>
+      </div>
+      <p id="audio-status" class="help">Plays in the browser as a normal MP3 stream. You can also open <a href="/stream.mp3">/stream.mp3</a> in VLC or any player.</p>
+    </section>
+
+    <section class="panel admin-only hidden" id="settings-panel">
+      <div class="panel-hdr"><span>Settings</span></div>
+      <form id="set-form" class="set-form" autocomplete="off">
+        <div class="field">
+          <label for="s-mode">Squelch mode</label>
+          <select id="s-mode" class="input">
+            <option value="audio">Audio level</option>
+            <option value="diff">Level swing (FM quieting)</option>
+            <option value="rf">RF carrier (rtl_fm)</option>
+          </select>
+        </div>
+        <div class="field" data-sq="audio">
+          <label for="s-db">Open at (dBFS)</label>
+          <input id="s-db" class="input" type="number" step="1" min="-120" max="0">
+        </div>
+        <div class="field" data-sq="diff">
+          <label for="s-diff">Swing needed (dB)</label>
+          <input id="s-diff" class="input" type="number" step="0.5" min="0.1" max="50">
+        </div>
+        <div class="field" data-sq="rf">
+          <label for="s-rf">RF squelch level</label>
+          <input id="s-rf" class="input" type="number" step="1" min="0" max="1000">
+        </div>
+        <p class="help full" data-sq="audio">Open while the level is at or above this. Watch the meter on an empty channel and set it a few dB above the noise. The line on the meter shows where it sits. Loud static on an empty FM channel will hold it open; use Level swing for that.</p>
+        <p class="help full" data-sq="diff">Open while the level moves by at least this much over a second. Built for FM quieting, where a real signal is quieter than open static but more dynamic. Start at 3.</p>
+        <p class="help full" data-sq="rf">rtl_fm's own squelch (-l). It sends nothing at all while the carrier is below the level, so dead air is dead silent. Raise it from 0 until an empty channel stops producing audio. Changing it restarts rtl_fm.</p>
+
+        <div class="field">
+          <label for="s-dwell">Dwell (seconds)</label>
+          <input id="s-dwell" class="input" type="number" step="0.5" min="0.2" max="600">
+        </div>
+        <label class="check field-check"><input id="s-mute" type="checkbox"> Silence while squelch is closed</label>
+        <p class="help full">Dwell is how long a channel has to stay quiet before the scan moves on. Long enough to catch the reply, usually 2 to 4.</p>
+
+        <div class="field">
+          <label for="s-rate">Audio sample rate</label>
+          <select id="s-rate" class="input">
+            <option value="8000">8000 Hz</option>
+            <option value="11025">11025 Hz</option>
+            <option value="16000">16000 Hz</option>
+            <option value="22050">22050 Hz</option>
+            <option value="24000">24000 Hz</option>
+            <option value="32000">32000 Hz</option>
+            <option value="44100">44100 Hz</option>
+            <option value="48000">48000 Hz</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="s-gain">Gain (dB)</label>
+          <input id="s-gain" class="input" placeholder="auto">
+        </div>
+        <div class="field">
+          <label for="s-ppm">PPM correction</label>
+          <input id="s-ppm" class="input" type="number" step="1" min="-500" max="500">
+        </div>
+        <div class="field">
+          <label for="s-dev">Device</label>
+          <input id="s-dev" class="input" placeholder="first dongle">
+        </div>
+        <p class="help full">16000 Hz is plenty for voice, use 32000 or more for WBFM. Gain is <b>auto</b> or a number like 40. PPM is your dongle's frequency error, <code>rtl_test -p</code> measures it. Device is an index or serial, only needed with more than one dongle. Changing any of these restarts rtl_fm, and a rate change reconnects listeners.</p>
+
+        <button class="btn primary full" type="submit">Apply settings</button>
+      </form>
+
+      <hr class="sep">
+
+      <form id="pw-form" class="set-form" autocomplete="off">
+        <div class="field grow">
+          <label for="pw-new">New admin password</label>
+          <input id="pw-new" class="input" type="password" autocomplete="new-password" minlength="8" placeholder="at least 8 characters">
+        </div>
+        <button class="btn danger full" type="submit">Change password</button>
+        <p class="help full">Changing it logs out every other session.</p>
+      </form>
+    </section>
+
+    <section class="panel">
+      <div class="panel-hdr"><span>System</span></div>
+      <div class="sys-row"><span>Version</span><span id="sys-ver">--</span></div>
+      <div class="sys-row"><span>Listeners</span><span id="sys-listen">--</span></div>
+      <div class="sys-row"><span>Squelch</span><span id="sys-sq">--</span></div>
+    </section>
+  </div>
+</main>
+
+<dialog id="login-dlg">
+  <form id="login-form" method="dialog">
+    <div class="dlg-title">// LOG IN</div>
+    <div class="field">
+      <label for="l-user">Username</label>
+      <input id="l-user" class="input" autocomplete="username" spellcheck="false" value="admin">
+    </div>
+    <div class="field">
+      <label for="l-pass">Password</label>
+      <input id="l-pass" class="input" type="password" autocomplete="current-password">
+    </div>
+    <div id="login-err" class="err-text"></div>
+    <div class="dlg-btns">
+      <button class="btn primary" type="submit" value="login">Log in</button>
+      <button class="btn" type="button" id="login-cancel">Cancel</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="pw-dlg">
+  <form id="pw-dlg-form" method="dialog">
+    <div class="dlg-title">// SET A PASSWORD</div>
+    <p class="help">You logged in with the one-time password from the container log. Pick your own before doing anything else.</p>
+    <div class="field">
+      <label for="pw-first">New password</label>
+      <input id="pw-first" class="input" type="password" autocomplete="new-password" minlength="8">
+    </div>
+    <div class="field">
+      <label for="pw-again">Same again</label>
+      <input id="pw-again" class="input" type="password" autocomplete="new-password" minlength="8">
+    </div>
+    <div id="pw-err" class="err-text"></div>
+    <div class="dlg-btns">
+      <button class="btn primary" type="submit" value="set">Save</button>
+      <button class="btn danger" type="button" id="pw-logout">Log out</button>
+    </div>
+  </form>
+</dialog>
+
+<div id="toast" role="status" aria-live="polite"></div>
+</body>
+</html>

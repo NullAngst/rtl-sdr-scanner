@@ -1,291 +1,200 @@
 # RTL-SDR Scanner
 
-A self-hosted web application for scanning multiple radio frequencies with an RTL-SDR dongle. Configure a list of frequencies, set a squelch threshold, and the scanner will automatically cycle through them - dwelling on any channel where it detects a signal and advancing when silence is detected.
+A self-hosted scanner for one RTL-SDR dongle: it cycles through your list of frequencies, stops on anything active, and streams what it hears to any browser as plain MP3. Anyone with the URL can listen; only the admin can change channels and settings.
 
-Any visitor can open the page and listen live. Only the admin account can add or remove frequencies, start or stop the scanner, or change settings.
-
----
+rtl_fm does the radio work and lame does the encoding. This program is a small Go server that supervises the two of them and serves the page.
 
 ## Features
 
-- **Multi-frequency auto-scan** - cycles through all configured frequencies, moves to the next after a configurable silence timeout (default 2 seconds)
-- **Software squelch** - tunable dBFS threshold; stays on a channel as long as signal is present
-- **Live audio streaming** - raw PCM decoded in the browser via Web Audio API, no plugins required
-- **Admin / visitor model** - visitors can listen; only the admin account manages frequencies and settings
-- **Real-time signal meter** - 20-segment LED-style bargraph updates at 10 Hz
-- **Persistent config** - frequencies and settings survive container restarts via a Docker volume
-- **Modes supported** - FM, AM, USB, LSB, RAW (anything `rtl_fm` accepts)
-- **PPM correction and gain control** - configurable from the web UI
+- Scans a channel list, holds while the squelch is open, moves on after a set dwell time
+- FM, AM, USB, LSB and WBFM, set per channel
+- Three squelch modes: audio level, level swing (for FM quieting), and rtl_fm's own RF squelch
+- Hold, skip, and click any channel to tune straight to it and hold
+- Lockout: keep a channel in the list but leave it out of the scan
+- Live signal meter with the squelch threshold marked on it
+- Normal MP3 stream at `/stream.mp3`, so it plays in any browser, on a phone with the screen off, or in VLC
+- Six themes: CRT, Light, Dark, Verdigris, Kawaii Light, Kawaii Dark
+- One-time admin password on first start, no shared default
 
----
+## Honest limits
 
-## Requirements
+- **Each hop costs 1 to 3 seconds.** rtl_fm can only listen to one frequency per run, so moving to the next channel means stopping it and starting a new one, and the dongle takes a moment to come up. A hardware scanner hops far faster. For a list of a few dozen channels it's fine. For hundreds, it's slow.
+- Audio runs 2 to 4 seconds behind live, since browsers buffer MP3 streams.
+- One dongle, one admin account. Logins are kept in memory, so a restart logs you out.
 
-| Requirement | Notes |
-|---|---|
-| RTL-SDR USB dongle | Any RTL2832U-based device (NooElec, RTL-SDR Blog v3, etc.) |
-| Linux host | USB device passthrough requires Linux; tested on Debian/Ubuntu |
-| Docker | 20.10 or newer |
-| Portainer | CE or BE, any recent version |
+## Prerequisites
 
-The dongle must be plugged in **before** the container starts. If you plug it in after, restart the container.
+- An RTL2832U dongle (RTL-SDR Blog, NooElec, or whichever)
+- A Linux host with Docker, and Portainer if you deploy stacks through it
+- The DVB-T kernel driver blacklisted on the host (step 1 below), or it grabs the dongle before rtl_fm can
 
----
+## Install with Portainer
 
-## Quick Start (Portainer)
+1. Blacklist the DVB-T driver on the host, since it claims the dongle at boot:
+   ```
+   printf 'blacklist dvb_usb_rtl28xxu\n' | sudo tee /etc/modprobe.d/rtlsdr-blacklist.conf
+   sudo modprobe -r dvb_usb_rtl28xxu
+   ```
+   It sticks across reboots. If `modprobe -r` says the module is in use, unplug the dongle and run it again.
+2. Plug the dongle in and check the host sees it: `lsusb | grep -i rtl`. You should see something like `Realtek Semiconductor Corp. RTL2838 DVB-T`.
+3. In Portainer, go to **Stacks > Add stack**, name it `rtl-sdr-scanner`, pick **Web editor**, and paste in `docker-compose.yml`.
+4. Optional: under **Environment variables** set `HOST_PORT` if 8073 is taken, and `TZ` for log timestamps.
+5. Click **Deploy the stack**. It pulls `ghcr.io/nullangst/rtl-sdr-scanner:latest`, so there's nothing to build.
+6. Open the container's **Logs** tab and find the block that starts with `One-time admin login`. From a shell it's:
+   ```
+   docker logs rtl-sdr-scanner 2>&1 | grep -A3 'One-time admin login'
+   ```
+7. Go to `http://your-host:8073`, click **Log in**, use `admin` and that password. It makes you set your own (8 characters minimum) before anything else works.
 
-This is the recommended deployment method. Portainer's Web Editor cannot access local host directories to build images, so you must build the image manually before deploying the stack.
+Until you set your own, a new one-time password is generated on every restart, so a restart before you log in never locks you out.
 
-### 1. Get the files
+No Portainer? Same file works with `docker compose up -d` in the folder that holds it.
 
-Clone the repository on your Docker host:
+## Using it
 
-```bash
+1. Click **+ Add** and enter a frequency in MHz, like `162.400`. Pick the mode: FM for narrowband voice (public safety, weather, marine, FRS/GMRS), AM for airband, WBFM for broadcast radio.
+2. Click **Start scan**.
+3. Click **Listen**. Anyone who opens the page can do this, logged in or not.
+4. Tune the squelch (next section) until empty channels read **SQL CLOSED** and real traffic reads **SQL OPEN**.
+
+While it's scanning:
+
+- **Hold** stops it moving on. **Resume** lets it go again.
+- **Skip** moves on right now, even mid-transmission.
+- Click a channel row to tune straight to it and hold there.
+- **Lock** keeps a channel in the list but out of the scan, handy for one that's stuck on noise.
+- The arrows reorder the list, which is the scan order.
+
+### Squelch modes
+
+Pick one under Settings. Watch the meter on an empty channel while you tune it.
+
+| Mode | How it decides | Good for |
+|---|---|---|
+| Audio level | Open while the level is at or above your threshold (dBFS). The line on the meter marks it. | AM, and FM channels with a quiet noise floor. Start a few dB above what an empty channel reads. |
+| Level swing | Open while the level moves by at least N dB over a second. | FM quieting, where real audio on a strong carrier is quieter than open static but more dynamic. Start at 3. |
+| RF carrier | rtl_fm's own squelch (`-l`). It sends nothing while the carrier is below the level. | Dead silence between transmissions. Raise from 0 until an empty channel goes quiet. Changing it restarts rtl_fm. |
+
+**Dwell** is how long a channel has to stay closed before the scan moves on. 2 to 4 seconds catches the reply in a back-and-forth. **Silence while squelch is closed** sends silence instead of static; turn it off while you're dialing in the threshold so you can hear what the detector hears.
+
+### Settings
+
+| Setting | Default | Notes |
+|---|---|---|
+| Squelch mode | Audio level | See above |
+| Open at (dBFS) | -35 | Audio level mode, -120 to 0 |
+| Swing needed (dB) | 3 | Level swing mode, 0.1 to 50 |
+| RF squelch level | 0 | RF carrier mode, 0 to 1000 |
+| Dwell | 2 s | 0.2 to 600 |
+| Silence while closed | on | |
+| Audio sample rate | 16000 | 16000 is plenty for voice; use 32000 or more for WBFM. Changing it reconnects listeners |
+| Gain | auto | Or a number in dB, like 40 |
+| PPM correction | 0 | Your dongle's frequency error. `rtl_test -p` measures it |
+| Device | first dongle | Index or serial, only needed with more than one dongle on the host |
+
+Everything is stored in `/data/config.json` in the volume. You can hand-edit it with the container stopped. Bad values get replaced with defaults one at a time and logged, and a file that won't parse at all gets renamed to `config.json.broken-<date>` instead of being overwritten.
+
+## Environment variables
+
+| Variable | Default | What it does |
+|---|---|---|
+| `PORT` | `8073` | Port inside the container |
+| `CONFIG_FILE` | `/data/config.json` | Config path |
+| `TRUST_PROXY` | unset | How many reverse proxies in front of it append to `X-Forwarded-For`. `1` for NPM, NPMPlus, nginx or Caddy alone, `2` with Cloudflare in front of that. Used for the login rate limit and secure cookies. LEAVE IT UNSET WHEN NOTHING IS IN FRONT, or anyone can fake their address past the rate limit |
+| `ALLOWED_ORIGINS` | unset | Extra origins allowed to send admin requests, comma separated. Only needed if your proxy rewrites the Host header |
+| `MAX_LISTENERS` | `25` | Concurrent audio streams |
+| `RTL_FM`, `LAME` | `rtl_fm`, `lame` | Paths, if they're not on PATH |
+| `TZ` | UTC | Time zone for log timestamps |
+
+## Behind a reverse proxy
+
+Point the proxy at port 8073 like any other site and turn on TLS there. Set `TRUST_PROXY=1` in the stack. The server sends `X-Accel-Buffering: no` on the audio and live-update streams, so nginx and NPM pass them through without buffering. Websockets support isn't needed; it doesn't use websockets.
+
+## Running without Docker
+
+Each release has static binaries for amd64, arm64 and armv7. I use apt, so in my case:
+
+1. `sudo apt install rtl-sdr lame`, or whichever package manager your distro uses.
+2. Download `rtl-sdr-scanner-linux-amd64` (or the one for your CPU) from Releases and `chmod +x` it.
+3. Run it: `CONFIG_FILE=$HOME/.config/rtl-sdr-scanner.json ./rtl-sdr-scanner-linux-amd64`
+4. Grab the one-time password from its output and log in at `http://localhost:8073`.
+
+Your user needs access to the dongle. The rtl-sdr package's udev rules usually handle that; if not, run it as root or add yourself to `plugdev`.
+
+## Building the image yourself
+
+```
 git clone https://github.com/NullAngst/rtl-sdr-scanner.git
 cd rtl-sdr-scanner
-```
-
-Or download and extract the ZIP from the Releases page.
-
-### 2. Build the Docker Image
-
-Build the image locally on your host machine:
-
-```bash
-docker build -t rtl-sdr-scanner:latest .
-```
-
-### 3. Generate a secret key
-
-```bash
-openssl rand -hex 32
-```
-
-Copy the output - you will paste it into the stack configuration in the next step.
-
-### 4. Create the stack in Portainer
-
-1. Open Portainer and navigate to **Stacks > Add stack**
-2. Give the stack a name, e.g. `rtl-sdr-scanner`
-3. Choose **Web editor** and paste the contents of `docker-compose.yml` directly.
-4. Under **Environment variables**, add:
-
-   | Variable | Value |
-   |---|---|
-   | `SECRET_KEY` | The hex string you generated above |
-   | `HOST_PORT` | The port you want to access the UI on (default: `8073`) |
-
-5. Click **Deploy the stack**
-
-Portainer will pull the local image from your Docker cache and start the container.
-
-### 5. Access the UI
-
-Open `http://your-host-ip:8073` in any browser.
-
-There is no fixed default password. On first start the container generates a one-time admin password and prints it to its log. In Portainer that's the container's **Logs** tab; from a shell:
-
-```bash
-docker logs rtl-sdr-scanner 2>&1 | grep -A3 "One-time admin login"
-```
-
-Log in as `admin` with that password. The UI then makes you set your own (minimum 8 characters). Until you do, a new one-time password is generated and logged on every restart.
-
-Upgrading an older install: if the stored password is still `changeme`, or is a legacy unsalted SHA-256 hash, it gets replaced with a one-time password the same way on next startup. Check the log after upgrading.
-
----
-
-## Manual Docker Run (no Portainer)
-
-If you prefer to run it directly:
-
-```bash
-# Build the image
 docker build -t rtl-sdr-scanner .
-
-# Run it
-docker run -d \
-  --name rtl-sdr-scanner \
-  -p 8073:8073 \
-  -e SECRET_KEY="$(openssl rand -hex 32)" \
-  -e CONFIG_FILE=/data/config.json \
-  -v rtl_sdr_data:/data \
-  --device /dev/bus/usb:/dev/bus/usb \
-  --restart unless-stopped \
-  rtl-sdr-scanner
 ```
 
-If device passthrough does not work, add `--privileged` instead of the `--device` flag.
+Then change the `image:` line in `docker-compose.yml` to `image: rtl-sdr-scanner`.
 
----
+## Making a release
 
-## First-Use Walkthrough
+1. Go to the repo's **Releases** page and click **Draft a new release**.
+2. Under **Choose a tag**, type a new tag like `v2.0.1` and pick **Create new tag on publish**.
+3. Fill in the notes and click **Publish release**.
+4. Go to **Actions**, click the **build** workflow, then **Run workflow**.
+5. Under **Use workflow from**, pick the tag you just made, since the workflow builds from whatever you pick there. Click **Run workflow**.
+6. It runs the checks, attaches static binaries and `SHA256SUMS` to that release, and pushes the image to `ghcr.io/nullangst/rtl-sdr-scanner` tagged `latest` and the version.
 
-1. **Log in** - click LOGIN in the top-right corner and use `admin` plus the one-time password from the container log
-2. **Change your password** - expand the Settings panel and set a new password
-3. **Add frequencies** - click `+ ADD` above the frequency list. Enter the frequency in Hz (e.g. `162400000` for 162.400 MHz NOAA Weather), a label, and a mode
-4. **Start the scanner** - click START SCAN. The display will show the current frequency and cycle automatically
-5. **Enable audio** - click ENABLE AUDIO. Audio starts immediately. Adjust volume with the slider
-6. **Share the URL** - any visitor who opens the page can enable audio and listen live without logging in
+The first time, the GHCR package starts out private. Go to your profile's **Packages**, open `rtl-sdr-scanner`, **Package settings**, and set it to public, or Portainer can't pull it without a login.
 
----
+If you run the workflow on `main` instead of a tag, or on a tag with no release, it stops with a message saying which. Running it again on the same tag replaces the files.
 
-## Configuration Reference
+## Upgrading from the Python version
 
-All settings are saved to `/data/config.json` inside the container (persisted via the Docker volume). You can edit them from the Settings panel in the UI, or edit the JSON file directly and restart the container. Frequency entries are validated on load: a numeric string for `freq` is converted, an invalid mode falls back to `fm`, and entries that cannot be repaired are dropped with a warning in the container log. Check the log after hand-editing.
+Your channels and settings carry over: on first start it reads the old `config.json` and converts it. Two things don't:
 
-| Setting | Default | Description |
-|---|---|---|
-| `squelch_db` | `-35.0` | Signal threshold in dBFS. Signals below this level are treated as silence. Increase (e.g. `-25`) to require a stronger signal; decrease (e.g. `-45`) to be more sensitive |
-| `dwell_time` | `2.0` | Seconds of continuous silence before advancing to the next frequency |
-| `sample_rate` | `16000` | Audio output sample rate in Hz. Higher values use more bandwidth. `16000` is good for voice |
-| `ppm` | `0` | Frequency correction in parts per million for your specific dongle. Use `rtl_test -p` to measure |
-| `gain` | `auto` | RF gain in dB, or `auto` to let the dongle decide. Try values like `30`, `40`, `49.6` |
+- **The admin password.** The old one was a Werkzeug scrypt hash that this version can't check, so you get a new one-time password in the log. Log in with that and set yours again.
+- **RAW mode** is gone (it was never listenable). Those channels come over as FM.
 
-### Supported Modes
+"Mute dead air" was off by default before, so it's off after the upgrade. Frequencies are entered in MHz now; typing a plain Hz value like `162400000` still works.
 
-| Mode | Use case |
-|---|---|
-| `fm` | Broadcast FM, public safety, weather radio, MURS, FRS |
-| `am` | Aircraft (airband), AM broadcast |
-| `usb` | Upper sideband - ham radio, maritime, military |
-| `lsb` | Lower sideband - 40m/80m/160m ham bands |
-| `raw` | Raw I/Q output |
-
----
-
-## Environment Variables
-
-These are set in `docker-compose.yml` or passed with `-e` on `docker run`:
-
-| Variable | Default | Description |
-|---|---|---|
-| `SECRET_KEY` | random | Not used by anything today. The app keeps its own in-memory session table and never signs a Flask session. Only matters if Flask sessions get added later |
-| `CONFIG_FILE` | `/data/config.json` | Path to the config file inside the container |
-| `PORT` | `8073` | Port the server listens on inside the container |
-| `ALLOWED_ORIGINS` | *(unset)* | Socket.IO CORS allowlist. Unset = same-origin only. Set to `*` for unrestricted (not recommended) or a comma-separated origin list, e.g. `https://radio.example.com,https://intra.lan` |
-| `TRUST_PROXY`     | *(unset)*           | Number of reverse proxies in front of the app that append to `X-Forwarded-For` (`1` for NPM/nginx/Caddy alone, `2` with Cloudflare in front of that). The client address is read that many entries from the right, since entries further left are whatever the client sent. Unset: the header is ignored and rate limiting uses the direct peer address. Enabled without a proxy: anyone can bypass the login rate limit by forging the header. Behind a proxy but unset: all clients share the proxy's address and one rate-limit bucket |
-
----
-
-## Frequency Reference (Common US Frequencies)
-
-| Frequency | Label | Mode |
-|---|---|---|
-| 162400000 | NOAA Weather (WX1) | FM |
-| 162425000 | NOAA Weather (WX2) | FM |
-| 162450000 | NOAA Weather (WX3) | FM |
-| 156800000 | Marine Channel 16 (Distress) | FM |
-| 121500000 | Aircraft Emergency | AM |
-| 155340000 | Fire/EMS (varies by region) | FM |
-| 460000000 | FRS/GMRS (varies) | FM |
-
-Enter frequencies in Hz (no decimals, no dots). For example, 162.400 MHz = `162400000`.
-
----
+Delete these from the repo, since nothing uses them any more: `server.py`, `requirements.txt`, `templates/`, `static/`.
 
 ## Troubleshooting
 
-### No audio in browser
+**"rtl_fm exited without producing audio" or "usb_claim_interface error -6."** Something else has the dongle. Usually the DVB-T driver (redo step 1 of the install), sometimes another container or program running rtl_fm, rtl_tcp or a decoder. After 5 failures in a row the scan stops and shows the error.
 
-The Web Audio API requires user interaction before it can play sound - this is a browser security requirement. Click **ENABLE AUDIO** after the page loads. If you still get nothing, check that the scanner is running and a frequency is active.
+**The host sees the dongle but the container doesn't.** Restart the container after plugging it in. If that doesn't help, swap `devices:` for `privileged: true` in the stack.
 
-### `rtl_fm: command not found`
+**It never stops on anything.** The squelch is too tight. Turn off "Silence while squelch is closed", listen to a busy channel, and lower the threshold (Audio level) or the swing (Level swing) until it opens.
 
-The `rtl-sdr` package was not installed in the image. Rebuild the image after verifying your Dockerfile is intact:
+**It never moves on.** The squelch is too loose, usually loud static on an empty FM channel holding Audio level open. Raise the threshold, or switch to Level swing or RF carrier.
 
-```bash
-docker build --no-cache -t rtl-sdr-scanner .
-```
+**Listen says "Stream dropped, reconnecting".** Normal for a moment after a sample rate change. If it keeps happening, the client is too slow for the stream and the server cut it loose; it reconnects at live.
 
-### Dongle not detected
+**The page says it lost the connection.** The live updates go through `/api/events`. If you're behind a proxy, check it isn't buffering responses.
 
-Check that the dongle is visible to the host:
-
-```bash
-lsusb | grep -i rtl
-```
-
-You should see something like `Realtek Semiconductor Corp. RTL2838 DVB-T`. If not, try a different USB port or cable.
-
-If the host sees it but the container does not, try switching to privileged mode in `docker-compose.yml`:
-
-```yaml
-    privileged: true
-    # devices:              # comment this out when using privileged
-    #   - /dev/bus/usb:/dev/bus/usb
-```
-
-### Kernel driver conflict (common on Linux)
-
-The `dvb_usb_rtl28xxu` kernel module claims the dongle before `rtl_fm` can. Blacklist it on the host:
-
-```bash
-echo 'blacklist dvb_usb_rtl28xxu' | sudo tee /etc/modprobe.d/rtlsdr.conf
-sudo modprobe -r dvb_usb_rtl28xxu
-```
-
-You only need to do this once. It persists across reboots.
-
-### Scanner skips too fast / stays too long
-
-Adjust **Squelch** and **Dwell Time** in the Settings panel:
-
-- Scanner moves too fast (not staying on active channels): lower the squelch threshold (more negative value)
-- Scanner won't advance (stuck on noise): raise the squelch threshold (less negative value)
-- Advances too quickly after signal drops: increase dwell time
-- Too slow to advance: decrease dwell time
-
-### Sessions don't survive container restarts
-
-This is expected - the session table is in-memory. Log in again after a restart. If you need persistent sessions across restarts, switch the app to Flask's signed-cookie sessions (uses `SECRET_KEY`) or an external store like Redis.
-
----
-
-## Architecture
+## How it works
 
 ```text
-Browser (any)
-    |
-    |  HTTP + WebSocket (Socket.IO)
-    |
-Flask + Flask-SocketIO  (server.py)
-    |
-    |  subprocess
-    |
-rtl_fm  (system binary from rtl-sdr package)
-    |
-    |  USB
-    |
-RTL-SDR Dongle
+browser  <-- MP3 (/stream.mp3) and live state (/api/events) --  rtl-sdr-scanner
+                                                                  |        |
+                                                              PCM in    PCM out
+                                                                  |        |
+                                                               rtl_fm    lame
+                                                                  |
+                                                            RTL-SDR dongle
 ```
 
-The scanner runs in a background thread. It spawns `rtl_fm` as a subprocess and reads raw signed 16-bit PCM from its stdout, buffering it into 100ms chunks. Each chunk is measured for RMS power (via NumPy), compared to the squelch threshold, and emitted to subscribed browsers as a base64-encoded binary blob via Socket.IO. The browser decodes the PCM and schedules it through the Web Audio API for gapless playback.
+One goroutine owns rtl_fm, so there's never a second one fighting over the dongle. It reads rtl_fm's PCM in 100 ms blocks, measures each one, decides whether the squelch is open, and passes the audio to lame. lame runs the whole time the server does; between hops it gets silence, so listeners never see the stream end. The page gets state and meter updates over Server-Sent Events.
 
-`rtl_fm` is invoked with a demodulation bandwidth chosen per mode (~16 kHz for `fm`/`am`/`usb`/`lsb`, ~170 kHz for `wbfm`) and always at an exact integer multiple of the output sample rate, because `rtl_fm`'s resampler computes its averaging window with integer division. A non-integer ratio costs both level and quality.
+rtl_fm's demodulation rate is always a whole multiple of the output rate, since its resampler uses integer division and anything else costs level and adds distortion. AM, USB and LSB get rtl_fm's DC filter, and the level meter removes DC too, so an AM carrier with no audio on it doesn't read as signal.
 
-`raw` mode emits interleaved I/Q rather than audio. The squelch meter and browser player both treat it as mono PCM, so it is useful for capture, not for listening.
+## Security notes
 
-Reads are non-blocking (`select` with a 50ms timeout). A single empty timeout is normal, since `rtl_fm` writes in bursts; only a sustained gap of 0.4s counts as dead air. That matters in `rf` mode, where `rtl_fm` emits nothing at all while the hardware gate is closed.
-
----
-
-## Security Notes
-
-- This application has no HTTPS out of the box. Put it behind a reverse proxy (nginx, Caddy, Traefik) with TLS if you expose it to the internet
-- There is no shared default password. A random one-time password is written to the container log and must be replaced on first login (8-character minimum). Anyone who can read the container log can read it, so change it right away
-- Passwords are stored as salted hashes via Werkzeug's `generate_password_hash`
-- Login attempts are rate-limited to 8 per IP per 5 minutes. See `TRUST_PROXY` for how the IP is determined
-- Changing the password invalidates all other active sessions
-- Session tokens are stored in `localStorage` on the client and expire after 24 hours. Tokens do not survive a container restart
-- Socket.IO only accepts connections whose `Origin` matches the host the page was served from (including `X-Forwarded-Proto`/`X-Forwarded-Host` from a proxy). If your proxy rewrites `Host`, list your public origin in `ALLOWED_ORIGINS`
-- The page refuses to be framed (`X-Frame-Options: DENY`). If you embed it in a dashboard iframe, remove the `_frame_headers` hook in `server.py`
-- Request bodies are capped at 64 KB
-- The Socket.IO browser client is served from `static/`, not a CDN
-- There is one admin account. Multiple admin accounts are not supported
-
----
+- No HTTPS of its own. Put it behind a reverse proxy with TLS if it faces the internet.
+- No shared default password. The one-time password is in the container log, so anyone who can read your logs can read it. Change it right away. Until you do, the server refuses every admin action except the password change.
+- Passwords are stored as PBKDF2-SHA256 hashes, 600,000 rounds.
+- Login is limited to 8 tries per address per 5 minutes.
+- The session cookie is HttpOnly and SameSite=Strict, and admin requests from other sites are refused. Changing the password logs out every other session.
+- The page loads nothing from outside: fonts and scripts are served by the app itself.
+- The container runs as root, since USB passthrough to rtl_fm needs it on most hosts.
 
 ## License
 
-MIT License. See `LICENSE` for details.
+MIT. See `LICENSE`. The VT323 and Share Tech Mono fonts in `web/fonts/` are under the SIL Open Font License, included as `web/fonts/OFL.txt`.

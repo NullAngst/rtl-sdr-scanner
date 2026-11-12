@@ -1,61 +1,33 @@
-# ─────────────────────────────────────────────────────────────────────────────
-#  RTL-SDR Scanner — Docker Compose Stack
-#
-#  Deploy this file as a Stack in Portainer.
-#  First run: the one-time admin password is printed in the container log.
-#  REQUIRED: Your RTL-SDR dongle must be plugged in before the container starts.
-# ─────────────────────────────────────────────────────────────────────────────
+# RTL-SDR Scanner stack. Paste this into Portainer: Stacks > Add stack > Web editor.
+# First start: the one-time admin password is in the container log.
+# Plug the dongle in BEFORE the container starts.
 
 services:
   rtl-sdr-scanner:
-    image: rtl-sdr-scanner:latest
+    # Built and published by this repo's GitHub Actions on every release.
+    # To build it yourself instead: docker build -t rtl-sdr-scanner . and
+    # change this line to image: rtl-sdr-scanner
+    image: ghcr.io/nullangst/rtl-sdr-scanner:latest
     container_name: rtl-sdr-scanner
-
-    # ── Network ───────────────────────────────────────────────────────────────
+    restart: unless-stopped
     ports:
       - "${HOST_PORT:-8073}:8073"
-
-    # ── Environment ───────────────────────────────────────────────────────────
     environment:
-      - PORT=8073
-      - CONFIG_FILE=/data/config.json
-      # Not used by the app today (no Flask sessions). Set one anyway if you
-      # like: `openssl rand -hex 32`
-      - SECRET_KEY=${SECRET_KEY:-change_this_to_a_random_secret_key_before_running}
-      # Optional: restrict Socket.IO CORS. Empty/unset = same-origin only.
-      # Set to "*" for unrestricted (not recommended) or a comma-separated
-      # list of origins, e.g. "https://radio.example.com,https://intra.lan".
-      # - ALLOWED_ORIGINS=
-      # Optional: set to 1 ONLY behind a reverse proxy you control that appends
-      # to X-Forwarded-For (NPM/NPMPlus do). Use 2 if there are two proxies
-      # (e.g. Cloudflare in front of NPM). Unset = header ignored.
+      - TZ=${TZ:-America/New_York}
+      # Behind NPM, NPMPlus, nginx or Caddy: 1. With Cloudflare in front of that: 2.
+      # Leave unset when nothing sits in front, or anyone can fake their IP
+      # past the login rate limit.
       # - TRUST_PROXY=1
-
-    # ── Persistent Storage ────────────────────────────────────────────────────
+      # Only needed if your proxy rewrites the Host header.
+      # - ALLOWED_ORIGINS=https://radio.example.com
+      # - MAX_LISTENERS=25
     volumes:
-      - rtl_sdr_data:/data               # stores config.json (frequencies, settings)
-
-    # ── USB / RTL-SDR Hardware Access ─────────────────────────────────────────
-    #
-    # Option A (recommended): pass through the entire USB bus.
-    # Works for most setups and is the simplest approach.
+      - rtl_sdr_data:/data   # config.json: channels, settings, password hash
+    # Pass the USB bus through. If the dongle still is not found, comment
+    # this out and use privileged instead.
     devices:
       - /dev/bus/usb:/dev/bus/usb
-
-    # Option B: if Option A doesn't work, uncomment privileged mode instead.
     # privileged: true
 
-    # ── Health + Restart ──────────────────────────────────────────────────────
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL",
-             "python -c \"import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('PORT','8073')+'/api/status', timeout=5)\""]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
-
-# ── Named Volumes ─────────────────────────────────────────────────────────────
 volumes:
   rtl_sdr_data:
-    driver: local
